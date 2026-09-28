@@ -1,0 +1,1 @@
+"""Utilities for preparing supplier purchase-invoice details for EFFI."""

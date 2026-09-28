@@ -1,0 +1,4 @@
+# Locally generated import files; keep source XML samples and the EFFI template.
+facturacion/output/
+__pycache__/
+*.py[cod]
