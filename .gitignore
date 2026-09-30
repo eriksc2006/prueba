@@ -2,3 +2,8 @@
 facturacion/output/
 __pycache__/
 *.py[cod]
+.env
+.env.*
+!.env.example
+.venv*/
+*.csv
