@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from dotenv import load_dotenv
 
@@ -103,6 +104,176 @@ def get_product_by_code(code: str) -> dict[str, Any] | None:
         if price is not None:
             product["PrecioConImpuestoTarifaNormal"] = float(price)
         return product
+
+
+def search_products(query_text: str, limit: int = 80) -> list[dict[str, Any]]:
+    """Search Azure products by user-entered terms for exception review."""
+    terms = list(dict.fromkeys(re.findall(r"[a-zA-Z0-9]+", (query_text or "").strip())))
+    if not terms:
+        return []
+
+    terms = sorted(terms, key=len, reverse=True)[:8]
+    fields = ("Nombre", "Referencia", "CodigoBarras", "Marca", "Categoria")
+    term_conditions = [
+        "(" + " OR ".join(f"{field} LIKE ?" for field in fields) + ")"
+        for _ in terms
+    ]
+    order_conditions = " + ".join(
+        f"CASE WHEN {condition} THEN 1 ELSE 0 END"
+        for condition in term_conditions
+    )
+    query = f"""
+        SELECT TOP {min(max(int(limit), 1), 100)}
+            IdProducto, CodigoBarras, Nombre, Referencia, Categoria, Marca,
+            PrecioConImpuestoTarifaNormal, PrecioConImpuestoTarifaMayorista
+        FROM [stg].[ProductoVerificador]
+        WHERE {' OR '.join(term_conditions)}
+        ORDER BY {order_conditions} DESC, Nombre, IdProducto
+    """
+    patterns = [f"%{term}%" for term in terms for _ in fields]
+    with closing(_connect()) as connection:
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(query, patterns + patterns)
+            columns = [column[0] for column in cursor.description]
+            products: dict[Any, dict[str, Any]] = {}
+            for row in cursor.fetchall():
+                product = dict(zip(columns, row))
+                if product.get("IdProducto") is not None:
+                    products.setdefault(product["IdProducto"], product)
+    return list(products.values())
+
+
+def get_product_by_id(product_id: Any) -> dict[str, Any] | None:
+    """Load one complete product record after a reviewer selects an ID."""
+    query = """
+        SELECT TOP 1
+            IdProducto, CodigoBarras, Nombre, Referencia, Categoria, Marca,
+            PrecioConImpuestoTarifaNormal, PrecioConImpuestoTarifaMayorista
+        FROM [stg].[ProductoVerificador]
+        WHERE IdProducto = ?
+    """
+    with closing(_connect()) as connection:
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(query, (product_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            columns = [column[0] for column in cursor.description]
+            return dict(zip(columns, row))
+
+
+def get_product_ids_by_barcodes(barcodes: Iterable[str]) -> dict[str, Any]:
+    """Return EFFI product IDs indexed by matching barcode."""
+    codes = list(dict.fromkeys(code.strip() for code in barcodes if code and code.strip()))
+    if not codes:
+        return {}
+
+    products: dict[str, Any] = {}
+    with closing(_connect()) as connection:
+        with closing(connection.cursor()) as cursor:
+            for offset in range(0, len(codes), 2000):
+                batch = codes[offset : offset + 2000]
+                placeholders = ", ".join("?" for _ in batch)
+                query = f"""
+                    SELECT CodigoBarras, IdProducto
+                    FROM [stg].[ProductoVerificador]
+                    WHERE CodigoBarras IN ({placeholders})
+                """
+                cursor.execute(query, batch)
+                for barcode, product_id in cursor.fetchall():
+                    if barcode is not None and product_id is not None:
+                        products.setdefault(str(barcode).strip(), product_id)
+    return products
+
+
+def _normalize_description(value: str) -> str:
+    import unicodedata
+
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(character for character in value if not unicodedata.combining(character))
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def get_product_candidates_by_descriptions(
+    descriptions: Iterable[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return Azure products that share meaningful tokens with each description."""
+    unique_descriptions = list(dict.fromkeys(
+        str(value).strip() for value in descriptions if value and str(value).strip()
+    ))
+    normalized_descriptions = {
+        _normalize_description(description): _normalize_description(description).split()
+        for description in unique_descriptions
+    }
+    tokens = list(dict.fromkeys(
+        token
+        for description_tokens in normalized_descriptions.values()
+        for token in description_tokens
+        if len(token) >= 3
+        or (any(character.isalpha() for character in token) and any(character.isdigit() for character in token))
+        or (token.isdigit() and len(token) >= 2)
+    ))
+    if not tokens:
+        return {}
+
+    products: dict[Any, dict[str, Any]] = {}
+    with closing(_connect()) as connection:
+        with closing(connection.cursor()) as cursor:
+            cursor.execute("""
+                SELECT
+                    IdProducto, CodigoBarras, Nombre, Referencia, Categoria, Marca,
+                    PrecioConImpuestoTarifaNormal, PrecioConImpuestoTarifaMayorista
+                FROM [stg].[ProductoVerificador]
+                WHERE IdProducto IS NOT NULL
+            """)
+            columns = [column[0] for column in cursor.description]
+            for row in cursor.fetchall():
+                product = dict(zip(columns, row))
+                products.setdefault(product["IdProducto"], product)
+
+    products_with_tokens = [
+        (
+            product,
+            set(_normalize_description(" ".join(
+                str(product.get(field) or "") for field in ("Nombre", "Referencia", "Marca", "Categoria")
+            )).split()),
+        )
+        for product in products.values()
+    ]
+    candidates_by_description: dict[str, list[dict[str, Any]]] = {}
+    for normalized, description_tokens in normalized_descriptions.items():
+        description_token_set = set(description_tokens)
+        ranked = sorted(
+            (
+                (product, len(description_token_set & product_tokens))
+                for product, product_tokens in products_with_tokens
+                if description_token_set & product_tokens
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        candidates_by_description[normalized] = [product for product, _ in ranked[:200]]
+
+    return candidates_by_description
+
+
+def get_product_by_description(description: str) -> dict[str, Any] | None:
+    """Return an Azure product by matching normalized description text."""
+    candidates = get_product_candidates_by_descriptions([description])
+    products = candidates.get(_normalize_description(description), [])
+    return products[0] if products else None
+
+
+def get_product_ids_by_descriptions(descriptions: Iterable[str]) -> dict[str, Any]:
+    """Return IdProducto mapped by normalized description when barcode lookup fails."""
+    normalized: dict[str, Any] = {}
+    for description in dict.fromkeys(
+        (str(item).strip() for item in descriptions if item and str(item).strip())
+    ):
+        product = get_product_by_description(description)
+        if product and product.get("IdProducto") is not None:
+            normalized[_normalize_description(description)] = product["IdProducto"]
+    return normalized
 
 
 def main() -> int:

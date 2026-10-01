@@ -6,11 +6,13 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
@@ -37,6 +39,7 @@ class InvoiceParseError(ValueError):
 class InvoiceLine:
     line_id: str
     item_code: str
+    barcode: str
     description: str
     quantity: Decimal
     unit: str
@@ -149,6 +152,25 @@ def _item_code(item: ET.Element | None) -> str:
     return ""
 
 
+def _barcode(item: ET.Element | None) -> str:
+    if item is None:
+        return ""
+    identifier = _child(item, "StandardItemIdentification")
+    if identifier is None:
+        return ""
+    code_element = _child(identifier, "ID")
+    if code_element is None:
+        return ""
+    scheme_id = code_element.attrib.get("schemeID", "").strip()
+    scheme_name = code_element.attrib.get("schemeName", "").strip().casefold()
+    if scheme_id != "010" and scheme_name != "gtin":
+        return ""
+    code = _text(code_element)
+    if not code.isdigit() or len(code) not in {8, 12, 13, 14}:
+        return ""
+    return code
+
+
 def _line_tax_rates(line: ET.Element) -> tuple[Decimal, ...]:
     rates: set[Decimal] = set()
     for tax_total in _children(line, "TaxTotal"):
@@ -220,6 +242,7 @@ def _parse_line(element: ET.Element) -> InvoiceLine:
     return InvoiceLine(
         line_id=_value(element, "ID"),
         item_code=_item_code(item),
+        barcode=_barcode(item),
         description=_value(item, "Description"),
         quantity=quantity,
         unit=quantity_element.attrib.get("unitCode", ""),
@@ -270,27 +293,186 @@ def _tax_code(line: InvoiceLine, mapping: dict[Decimal, int]) -> int | None:
     return next((code for rate, code in mapping.items() if rate.normalize() == normalized_rate), None)
 
 
-def _line_warnings(line: InvoiceLine, mapping: dict[Decimal, int]) -> list[str]:
+def _normalize_description(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(character for character in value if not unicodedata.combining(character))
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _presentation_tokens(value: str) -> set[str]:
+    return {
+        re.sub(r"\s+", "", match.group(0).lower()).replace(",", ".")
+        for match in re.finditer(
+            r"\b(?:px\s*\d+|\d+(?:[.,]\d+)?\s*(?:ml|lt|l|gr|g|kg|mg|oz|und|unidades?))\b",
+            value.lower(),
+        )
+    }
+
+
+def _candidate_score(line: InvoiceLine, product: Mapping[str, Any]) -> float:
+    description = _normalize_description(line.description)
+    name = _normalize_description(str(product.get("Nombre") or ""))
+    reference = _normalize_description(str(product.get("Referencia") or ""))
+    brand = _normalize_description(str(product.get("Marca") or ""))
+    category = _normalize_description(str(product.get("Categoria") or ""))
+    source_tokens = set(description.split())
+    name_tokens = set((name + " " + reference).split())
+    catalog_tokens = set((name + " " + reference + " " + brand + " " + category).split())
+    if not source_tokens or not catalog_tokens:
+        return 0.0
+
+    overlap = len(source_tokens & catalog_tokens) / len(source_tokens)
+    jaccard = len(source_tokens & name_tokens) / max(len(source_tokens | name_tokens), 1)
+    text_similarity = SequenceMatcher(None, description, name + " " + reference).ratio()
+    brand_tokens = set(brand.split())
+    brand_match = len(brand_tokens & source_tokens) / len(brand_tokens) if brand_tokens else None
+
+    source_presentation = _presentation_tokens(line.description)
+    product_presentation = _presentation_tokens(str(product.get("Nombre") or ""))
+    if not product_presentation:
+        product_presentation = _presentation_tokens(str(product.get("Referencia") or ""))
+    presentation_match = (
+        float(bool(source_presentation & product_presentation))
+        if source_presentation and product_presentation
+        else None
+    )
+
+    invoice_price = line.unit_price
+    if len(line.tax_rates) == 1:
+        invoice_price *= Decimal("1") + line.tax_rates[0] / Decimal("100")
+    catalog_prices = [
+        Decimal(str(product[field]))
+        for field in ("PrecioConImpuestoTarifaNormal", "PrecioConImpuestoTarifaMayorista")
+        if product.get(field) is not None
+    ]
+    price_match = None
+    if catalog_prices and invoice_price > 0:
+        relative_difference = min(
+            abs(price - invoice_price) / max(abs(invoice_price), Decimal("1"))
+            for price in catalog_prices
+        )
+        price_match = max(0.0, 1.0 - float(relative_difference))
+
+    components = [(overlap, 0.42), (jaccard, 0.08), (text_similarity, 0.14)]
+    if brand_match is not None:
+        components.append((brand_match, 0.12))
+    if presentation_match is not None:
+        components.append((presentation_match, 0.14))
+    if price_match is not None:
+        components.append((price_match, 0.10))
+    total_weight = sum(weight for _, weight in components)
+    return sum(value * weight for value, weight in components) / total_weight
+
+
+def _description_match(
+    line: InvoiceLine,
+    product_ids_by_description: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any] | None, float, float]:
+    if not line.description or product_ids_by_description is None:
+        return None, 0.0, 0.0
+    value = product_ids_by_description.get(_normalize_description(line.description))
+    if value is None:
+        return None, 0.0, 0.0
+    if not isinstance(value, (list, tuple)):
+        if isinstance(value, Mapping):
+            return value, 1.0, 1.0
+        return {"IdProducto": value}, 1.0, 1.0
+
+    ranked = sorted(
+        ((candidate, _candidate_score(line, candidate)) for candidate in value),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if not ranked:
+        return None, 0.0, 0.0
+    best, score = ranked[0]
+    runner_up_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    return best, score, score - runner_up_score
+
+
+def _resolved_product(
+    line: InvoiceLine,
+    product_ids_by_barcode: Mapping[str, Any] | None,
+    product_ids_by_description: Mapping[str, Any] | None,
+) -> tuple[Any, Mapping[str, Any] | None, float, float, bool]:
+    if line.barcode and product_ids_by_barcode is not None:
+        barcode_product_id = product_ids_by_barcode.get(line.barcode)
+        if barcode_product_id is not None:
+            return barcode_product_id, None, 1.0, 1.0, True
+    candidate, score, margin = _description_match(line, product_ids_by_description)
+    accepted = bool(
+        candidate
+        and candidate.get("IdProducto") is not None
+        and score >= 0.72
+        and (margin >= 0.06 or margin == 1.0)
+    )
+    if accepted:
+        return candidate["IdProducto"], candidate, score, margin, True
+    return line.item_code, candidate, score, margin, False
+
+
+def _import_amounts(line: InvoiceLine) -> tuple[Decimal, Decimal, Decimal]:
+    """Keep the XML line net amount authoritative in the values sent to EFFI."""
+    price = line.unit_price
+    discount = line.discount_total
+    source_delta = price * line.quantity - discount - line.net_amount
+    if source_delta and line.quantity > 0:
+        adjusted_discount = price * line.quantity - line.net_amount
+        if adjusted_discount >= 0:
+            discount = adjusted_discount
+        else:
+            price = (line.net_amount + discount) / line.quantity
+    return price, discount, source_delta
+
+
+def _line_warnings(
+    line: InvoiceLine,
+    mapping: dict[Decimal, int],
+    product_ids_by_barcode: Mapping[str, Any] | None = None,
+    product_ids_by_description: Mapping[str, Any] | None = None,
+) -> list[str]:
     warnings: list[str] = []
     label = f"línea {line.line_id or '?'}"
     if not line.item_code:
         warnings.append(f"{label}: no se encontró código de artículo; completar en EFFI.")
+    if product_ids_by_barcode is not None or product_ids_by_description is not None:
+        _, _, score, margin, resolved = _resolved_product(
+            line, product_ids_by_barcode, product_ids_by_description
+        )
+        if not resolved:
+            reason = (
+                f"código de barras {line.barcode} sin coincidencia confiable"
+                if line.barcode and product_ids_by_barcode is not None
+                else "descripción sin coincidencia confiable"
+            )
+            if score:
+                reason += f" (candidato más cercano: {score:.0%}, diferencia {margin:.0%})"
+            warnings.append(f"{label}: {reason}; revisar artículo.")
     if line.quantity <= 0:
         warnings.append(f"{label}: cantidad no positiva ({line.quantity}).")
     if len(line.tax_rates) != 1:
         warnings.append(f"{label}: tasa de impuesto ausente o múltiple; revisar código de impuesto.")
     elif _tax_code(line, mapping) is None:
         warnings.append(f"{label}: tasa {line.tax_rates[0]}% sin código EFFI configurado.")
-    expected_net = line.unit_price * line.quantity - line.discount_total
-    if abs(expected_net - line.net_amount) > PRICE_RECONCILIATION_LIMIT:
+    import_price, import_discount, source_delta = _import_amounts(line)
+    expected_net = import_price * line.quantity - import_discount
+    if abs(expected_net - line.net_amount) > Decimal("0.005"):
         warnings.append(
-            f"{label}: precio × cantidad - descuento ({expected_net}) no coincide con el neto XML "
+            f"{label}: no se pudo conciliar el neto importado ({expected_net}) con el neto XML "
             f"({line.net_amount}); revisar la línea antes de importarla."
         )
+    elif source_delta:
+        warnings.append(f"{label}: ajuste de {source_delta} para igualar el neto declarado en el XML.")
     return warnings
 
 
-def _write_detail(sheet: Worksheet, invoice: Invoice, tax_codes: dict[Decimal, int]) -> None:
+def _write_detail(
+    sheet: Worksheet,
+    invoice: Invoice,
+    tax_codes: dict[Decimal, int],
+    product_ids_by_barcode: Mapping[str, Any] | None = None,
+    product_ids_by_description: Mapping[str, Any] | None = None,
+) -> None:
     # The supplied workbook has sample lines in rows 2-4. Remove cell values
     # only; preserve the template's formatting and its header row.
     for row in sheet.iter_rows(min_row=2, max_row=max(sheet.max_row, len(invoice.lines) + 1), min_col=1, max_col=9):
@@ -299,15 +481,19 @@ def _write_detail(sheet: Worksheet, invoice: Invoice, tax_codes: dict[Decimal, i
 
     style_source = [sheet.cell(row=2, column=column) for column in range(1, 10)]
     for row_number, line in enumerate(invoice.lines, start=2):
+        resolved_id, _, _, _, _ = _resolved_product(
+            line, product_ids_by_barcode, product_ids_by_description
+        )
+        import_price, import_discount, _ = _import_amounts(line)
         values = (
-            line.item_code,             # A: EFFI article ID / barcode / serial
+            resolved_id,                # A: EFFI article ID
             None,                       # B: EFFI expense-type ID (not in DIAN UBL)
             None,                       # C: lot (not in DIAN UBL)
             None,                       # D: serial (not in DIAN UBL)
             None,                       # E: observation (kept for manual entry)
             line.quantity,              # F: quantity
-            line.unit_price,            # G: unit price
-            line.discount_total,        # H: total line discount
+            import_price,               # G: unit price
+            import_discount,            # H: total line discount
             _tax_code(line, tax_codes), # I: configured EFFI tax ID
         )
         for column, value in enumerate(values, start=1):
@@ -354,11 +540,65 @@ def generate_workbook(
     output: Path,
     tax_codes: dict[Decimal, int],
     write_json: bool = False,
+    product_ids_by_barcode: Mapping[str, Any] | None = None,
+    product_ids_by_description: Mapping[str, Any] | None = None,
 ) -> list[str]:
     invoice = parse_invoice(source)
     workbook = load_workbook(template)
     sheet = workbook.active
-    _write_detail(sheet, invoice, tax_codes)
+    _write_detail(sheet, invoice, tax_codes, product_ids_by_barcode, product_ids_by_description)
+    unresolved_lookup = product_ids_by_barcode is not None or product_ids_by_description is not None
+    exceptions = []
+    for line in invoice.lines:
+        _, candidate, score, margin, resolved = _resolved_product(
+            line, product_ids_by_barcode, product_ids_by_description
+        )
+        import_price, import_discount, source_delta = _import_amounts(line)
+        if (unresolved_lookup and not resolved) or source_delta or line.quantity <= 0:
+            reasons = []
+            if unresolved_lookup and not resolved:
+                reasons.append("Sin coincidencia confiable" if not score else "Candidato cercano; validar identidad")
+            if source_delta:
+                reasons.append("Neto XML conciliado; revisar diferencia fuente")
+            if line.quantity <= 0:
+                reasons.append("Cantidad no positiva")
+            exceptions.append((line, candidate, score, margin, resolved, source_delta, import_discount, "; ".join(reasons)))
+    if exceptions:
+        exception_sheet = workbook.create_sheet("Excepciones")
+        exception_sheet.append([
+            "Línea", "Tipo", "Código de barras", "Descripción factura", "Cantidad",
+            "Presentación factura", "Precio unitario XML", "Descuento XML", "Neto XML", "Neto calculado XML",
+            "Ajuste aplicado al descuento", "IdProducto candidato", "Nombre candidato",
+            "Presentación candidato", "Referencia", "Marca", "Categoría", "Precio normal", "Precio mayorista",
+            "Puntaje", "Decisión",
+        ])
+        for line, candidate, score, margin, resolved, source_delta, import_discount, reason in exceptions:
+            nearest = candidate or {}
+            exception_sheet.append([
+                line.line_id,
+                reason,
+                line.barcode,
+                line.description,
+                float(line.quantity),
+                ", ".join(sorted(_presentation_tokens(line.description))),
+                float(line.unit_price),
+                float(line.discount_total),
+                float(line.net_amount),
+                float(line.unit_price * line.quantity - line.discount_total),
+                float(import_discount - line.discount_total),
+                nearest.get("IdProducto"),
+                nearest.get("Nombre"),
+                ", ".join(sorted(_presentation_tokens(
+                    str(nearest.get("Nombre") or "") + " " + str(nearest.get("Referencia") or "")
+                ))),
+                nearest.get("Referencia"),
+                nearest.get("Marca"),
+                nearest.get("Categoria"),
+                nearest.get("PrecioConImpuestoTarifaNormal"),
+                nearest.get("PrecioConImpuestoTarifaMayorista"),
+                score,
+                "Usado" if resolved else f"Revisar; margen {margin:.0%}",
+            ])
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
     workbook.close()
@@ -368,7 +608,11 @@ def generate_workbook(
             json.dumps(_json_invoice(invoice), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    return [warning for line in invoice.lines for warning in _line_warnings(line, tax_codes)]
+    return [
+        warning
+        for line in invoice.lines
+        for warning in _line_warnings(line, tax_codes, product_ids_by_barcode, product_ids_by_description)
+    ]
 
 
 def _sources(input_path: Path) -> list[Path]:
@@ -394,6 +638,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Mapeo adicional/sobrescrito de tasa DIAN a código EFFI (repetible). Ej.: 5=3.",
     )
     parser.add_argument("--json", action="store_true", help="Guarda también el detalle estructurado como JSON.")
+    parser.add_argument(
+        "--azure-lookup",
+        action="store_true",
+        help="Busca los códigos de barras en Azure SQL y escribe el IdProducto EFFI encontrado.",
+    )
     args = parser.parse_args(argv)
 
     if not args.template.is_file():
@@ -407,12 +656,48 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     failures = 0
-    for source in sources:
+    invoices: dict[Path, Invoice] = {}
+    product_ids_by_barcode: Mapping[str, Any] | None = None
+    product_ids_by_description: Mapping[str, Any] | None = None
+    if args.azure_lookup:
+        for source in sources:
+            try:
+                invoices[source] = parse_invoice(source)
+            except (InvoiceParseError, OSError, ValueError) as exc:
+                failures += 1
+                print(f"ERROR {source.name}: {exc}", file=sys.stderr)
         try:
-            invoice = parse_invoice(source)
+            from .azure_codes import get_product_candidates_by_descriptions, get_product_ids_by_barcodes
+
+            product_ids_by_barcode = get_product_ids_by_barcodes(
+                line.barcode for invoice in invoices.values() for line in invoice.lines if line.barcode
+            )
+            product_ids_by_description = get_product_candidates_by_descriptions(
+                line.description for invoice in invoices.values() for line in invoice.lines if line.description
+            )
+            print(f"Azure: {len(product_ids_by_barcode)} código(s) de barras asociado(s) a productos EFFI.")
+            candidate_count = sum(len(products) for products in product_ids_by_description.values())
+            print(f"Azure fallback por descripción: {candidate_count} candidato(s) evaluados.")
+        except Exception as exc:
+            print(f"ERROR al consultar Azure SQL: {exc}", file=sys.stderr)
+            return 1
+
+    for source in sources:
+        if args.azure_lookup and source not in invoices:
+            continue
+        try:
+            invoice = invoices[source] if args.azure_lookup else parse_invoice(source)
             destination = args.output_dir / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
-            warnings = generate_workbook(source, args.template, destination, tax_codes, args.json)
-            print(f"OK {source.name} → {destination} ({len(invoice.lines)} líneas)")
+            warnings = generate_workbook(
+                source,
+                args.template,
+                destination,
+                tax_codes,
+                args.json,
+                product_ids_by_barcode,
+                product_ids_by_description,
+            )
+            print(f"OK {source.name} -> {destination} ({len(invoice.lines)} líneas)")
             for warning in warnings:
                 print(f"  AVISO: {warning}")
         except (InvoiceParseError, OSError, ValueError) as exc:

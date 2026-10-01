@@ -34,6 +34,14 @@ Procesa todos los XML de ejemplo (o los archivos que se coloquen en esa carpeta)
 python -m facturacion.generar_importacion
 ```
 
+Para buscar primero por código de barras en Azure SQL y, si no hay coincidencia, comparar por descripción:
+
+```powershell
+python -m facturacion.generar_importacion --azure-lookup
+```
+
+La comparación por descripción considera texto, marca, presentación y precios disponibles en el catálogo; solo asigna automáticamente coincidencias con confianza suficiente y sin empate cercano. Los casos dudosos incluyen en la hoja `Excepciones` el candidato más cercano para revisión. Esta hoja también registra diferencias entre el descuento indicado en el XML y el neto de línea; el Excel ajusta el descuento para que cantidad × precio - descuento reproduzca el neto declarado por la factura. La conexión requiere que el firewall del servidor Azure SQL permita la IP de origen.
+
 Indica otra carpeta/archivo y otro destino:
 
 ```powershell
@@ -51,6 +59,16 @@ Para guardar junto al Excel una representación JSON de los datos extraídos:
 ```powershell
 python -m facturacion.generar_importacion --json
 ```
+
+## Revisión humana de excepciones
+
+Inicia el visor Streamlit desde la raíz del repositorio:
+
+```powershell
+streamlit run facturacion/revisar_excepciones.py
+```
+
+El visor solo muestra líneas de la hoja `Excepciones`. Identifica la factura activa y avanza en secuencia por sus líneas; al resolverlas, pasa a la siguiente factura pendiente. Permite comparar la descripción y los valores del XML con el candidato Azure, volver a buscar por descripción, marca, referencia o código, y guardar confirmaciones manuales en `facturacion/output/revisiones_manuales.json`. Las confirmaciones asignan el artículo elegido y “No coincide” lo deja vacío en un archivo `*_revisado.xlsx`, sin sobrescribir el libro original; las revisiones locales se mantienen fuera de Git junto con la carpeta `output/`.
 
 El programa muestra avisos si faltan identificadores de artículo, hay tasas tributarias sin mapear o los valores de precio, cantidad, descuento y neto no concuerdan. Revisa esos avisos antes de importar en EFFI.
 
