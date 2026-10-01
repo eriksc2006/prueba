@@ -143,6 +143,26 @@ def search_products(query_text: str, limit: int = 80) -> list[dict[str, Any]]:
     return list(products.values())
 
 
+def search_products_by_barcode(barcode: str) -> list[dict[str, Any]]:
+    """Search only by an exact barcode match in the EFFI product catalog."""
+    code = (barcode or "").strip()
+    if not code:
+        return []
+    query = """
+        SELECT
+            IdProducto, CodigoBarras, Nombre, Referencia, Categoria, Marca,
+            PrecioConImpuestoTarifaNormal, PrecioConImpuestoTarifaMayorista
+        FROM [stg].[ProductoVerificador]
+        WHERE CodigoBarras = ?
+        ORDER BY IdProducto
+    """
+    with closing(_connect()) as connection:
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(query, (code,))
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall() if row[0] is not None]
+
+
 def get_product_by_id(product_id: Any) -> dict[str, Any] | None:
     """Load one complete product record after a reviewer selects an ID."""
     query = """

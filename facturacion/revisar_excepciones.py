@@ -17,7 +17,7 @@ REPOSITORY_ROOT = ROOT.parent
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from facturacion.azure_codes import search_products
+from facturacion.azure_codes import search_products, search_products_by_barcode
 from facturacion.generar_importacion import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_XML_DIR,
@@ -99,6 +99,17 @@ def _invoice_queue() -> list[dict[str, Any]]:
             continue
         exceptions = _read_exception_rows(output)
         if exceptions:
+            workbook = load_workbook(output, read_only=True, data_only=True)
+            try:
+                detail = workbook[DETAIL_SHEET] if DETAIL_SHEET in workbook.sheetnames else workbook.active
+                article_ids = {
+                    str(line.line_id): detail.cell(row=row, column=1).value
+                    for row, line in enumerate(invoice.lines, start=2)
+                }
+                for item in exceptions:
+                    item["Artículo EFFI"] = article_ids.get(str(item.get("Línea")))
+            finally:
+                workbook.close()
             queue.append({
                 "source": source,
                 "invoice": invoice,
@@ -365,6 +376,8 @@ def main() -> None:
         line = line_by_id.get(line_id)
         review_key = f"{source.stem}_{line_id}"
         candidate = _product_from_exception(item)
+        if line and line.barcode and not item.get("Artículo EFFI"):
+            candidate = None
         confidence = item.get("Puntaje")
 
         st.markdown(f"#### Producto de la factura · Línea {line_id}")
@@ -374,6 +387,15 @@ def main() -> None:
             description = line.description if line else item.get("Descripción factura")
             st.markdown(f"**{html.escape(str(description or 'Descripción vacía'))}**")
             st.caption(f"Código de barras: {_display(line.barcode if line else item.get('Código de barras'))}")
+            if line and line.barcode:
+                if item.get("Artículo EFFI"):
+                    st.success(f"GTIN registrado en EFFI · IdProducto {item['Artículo EFFI']}")
+                else:
+                    st.error(
+                        f"Código de barras {line.barcode} no registrado en EFFI para el producto "
+                        f"'{html.escape(line.description or 'sin descripción')}'. "
+                        "Vincula este código al producto en EFFI; no se buscará por descripción."
+                    )
             invoice_presentation = item.get("Presentación factura")
             if invoice_presentation is None or str(invoice_presentation).strip().lower() == "none":
                 invoice_presentation = ", ".join(sorted(_presentation_tokens(description or "")))
@@ -392,22 +414,31 @@ def main() -> None:
                 st.warning("Marcado como sin coincidencia confiable.")
 
         with st.expander(
-            "Buscar manualmente en EFFI",
+            "Consultar código exacto en EFFI" if line and line.barcode else "Buscar manualmente en EFFI",
             expanded=candidate is None or float(confidence or 0) < 0.72,
         ):
             search_form = st.form(f"search_form_{review_key}")
             with search_form:
                 query_text = st.text_input(
-                    "Buscar por descripción, marca, referencia o código",
-                    value=str(item.get("Descripción factura") or ""),
+                    "Código de barras de la factura" if line and line.barcode
+                    else "Buscar por descripción, marca, referencia o código",
+                    value=line.barcode if line and line.barcode else str(item.get("Descripción factura") or ""),
                     key=f"query_{review_key}",
+                    disabled=bool(line and line.barcode),
                 )
-                search_submitted = st.form_submit_button("Buscar en EFFI", type="primary")
+                search_submitted = st.form_submit_button(
+                    "Consultar GTIN" if line and line.barcode else "Buscar en EFFI",
+                    type="primary",
+                )
             hits_key = f"azure_hits_{review_key}"
             if search_submitted:
                 try:
                     with st.spinner("Consultando catálogo EFFI..."):
-                        st.session_state[hits_key] = search_products(query_text, limit=80)
+                        st.session_state[hits_key] = (
+                            search_products_by_barcode(line.barcode)
+                            if line and line.barcode
+                            else search_products(query_text, limit=80)
+                        )
                 except Exception as error:
                     st.error(f"No se pudo consultar Azure: {error}")
 
@@ -455,7 +486,12 @@ def main() -> None:
                     st.success("Decisión guardada.")
                     st.rerun()
             else:
-                st.info("Sin resultados todavía. Ajusta la búsqueda y consulta Azure.")
+                if line and line.barcode:
+                    st.error(
+                        f"El GTIN {line.barcode} no aparece en EFFI. Vincula ese código al producto desde EFFI."
+                    )
+                else:
+                    st.info("Sin resultados todavía. Ajusta la búsqueda y consulta EFFI.")
             if review.get("status") in {"confirmed", "no_match"}:
                 if st.button("Reabrir esta línea", key=f"reopen_{review_key}"):
                     _record_review(review_state, source, line_id, "pending")

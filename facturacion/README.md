@@ -34,13 +34,13 @@ Procesa todos los XML de ejemplo (o los archivos que se coloquen en esa carpeta)
 python -m facturacion.generar_importacion
 ```
 
-Para buscar primero por código de barras en Azure SQL y, si no hay coincidencia, comparar por descripción:
+Para consultar el catálogo EFFI y generar las excepciones de revisión:
 
 ```powershell
 python -m facturacion.generar_importacion --azure-lookup
 ```
 
-La comparación por descripción considera texto, marca, presentación y precios disponibles en el catálogo; solo asigna automáticamente coincidencias con confianza suficiente y sin empate cercano. Los casos dudosos incluyen en la hoja `Excepciones` el candidato más cercano para revisión. Esta hoja también registra diferencias entre el descuento indicado en el XML y el neto de línea; el Excel ajusta el descuento para que cantidad × precio - descuento reproduzca el neto declarado por la factura. La conexión requiere que el firewall del servidor Azure SQL permita la IP de origen.
+Si la factura incluye código de barras, el artículo se busca exclusivamente por ese código: no se asigna un producto por descripción cuando el GTIN no aparece en el catálogo. En ese caso se genera una alerta para vincular el código al producto desde EFFI. La búsqueda por descripción, marca, presentación y precios solo se usa cuando la línea no trae código de barras; las coincidencias dudosas quedan en `Excepciones` para revisión. La hoja también registra diferencias entre el descuento indicado en el XML y el neto de línea; el Excel ajusta el descuento para que cantidad × precio - descuento reproduzca el neto declarado por la factura. La conexión requiere que el firewall de Azure SQL permita la IP de origen.
 
 Indica otra carpeta/archivo y otro destino:
 

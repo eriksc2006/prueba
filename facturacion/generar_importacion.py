@@ -395,10 +395,13 @@ def _resolved_product(
     product_ids_by_barcode: Mapping[str, Any] | None,
     product_ids_by_description: Mapping[str, Any] | None,
 ) -> tuple[Any, Mapping[str, Any] | None, float, float, bool]:
-    if line.barcode and product_ids_by_barcode is not None:
+    if line.barcode:
+        if product_ids_by_barcode is None:
+            return line.item_code, None, 0.0, 0.0, False
         barcode_product_id = product_ids_by_barcode.get(line.barcode)
         if barcode_product_id is not None:
             return barcode_product_id, None, 1.0, 1.0, True
+        return None, None, 0.0, 0.0, False
     candidate, score, margin = _description_match(line, product_ids_by_description)
     accepted = bool(
         candidate
@@ -441,7 +444,8 @@ def _line_warnings(
         )
         if not resolved:
             reason = (
-                f"código de barras {line.barcode} sin coincidencia confiable"
+                f"Código de barras {line.barcode} no registrado en EFFI para el producto "
+                f"'{line.description or 'sin descripción'}'; vincular este código en EFFI"
                 if line.barcode and product_ids_by_barcode is not None
                 else "descripción sin coincidencia confiable"
             )
@@ -557,7 +561,13 @@ def generate_workbook(
         if (unresolved_lookup and not resolved) or source_delta or line.quantity <= 0:
             reasons = []
             if unresolved_lookup and not resolved:
-                reasons.append("Sin coincidencia confiable" if not score else "Candidato cercano; validar identidad")
+                if line.barcode:
+                    reasons.append(
+                        f"Código de barras no registrado en EFFI para el producto "
+                        f"'{line.description or 'sin descripción'}'; vincular este código en EFFI"
+                    )
+                else:
+                    reasons.append("Sin coincidencia confiable" if not score else "Candidato cercano; validar identidad")
             if source_delta:
                 reasons.append("Neto XML conciliado; revisar diferencia fuente")
             if line.quantity <= 0:
@@ -673,7 +683,10 @@ def main(argv: list[str] | None = None) -> int:
                 line.barcode for invoice in invoices.values() for line in invoice.lines if line.barcode
             )
             product_ids_by_description = get_product_candidates_by_descriptions(
-                line.description for invoice in invoices.values() for line in invoice.lines if line.description
+                line.description
+                for invoice in invoices.values()
+                for line in invoice.lines
+                if line.description and not line.barcode
             )
             print(f"Azure: {len(product_ids_by_barcode)} código(s) de barras asociado(s) a productos EFFI.")
             candidate_count = sum(len(products) for products in product_ids_by_description.values())

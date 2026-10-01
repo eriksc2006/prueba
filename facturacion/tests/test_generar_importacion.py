@@ -149,6 +149,39 @@ class WorkbookGenerationTests(unittest.TestCase):
             self.assertEqual(workbook.active.cell(2, 1).value, 98765)
             workbook.close()
 
+    def test_unregistered_barcode_does_not_fall_back_to_description(self) -> None:
+        from facturacion.generar_importacion import _normalize_description
+
+        source = XML_DIR / "ad080021284002726837920260926084002509.xml"
+        invoice = parse_invoice(source)
+        line = next(item for item in invoice.lines if item.barcode)
+        candidate = {
+            "IdProducto": 99999,
+            "Nombre": line.description,
+            "Referencia": "TEST",
+            "Marca": "TEST",
+            "Categoria": "TEST",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "barcode_not_registered.xlsx"
+            warnings = generate_workbook(
+                source,
+                TEMPLATE,
+                output,
+                DEFAULT_TAX_CODES,
+                product_ids_by_barcode={},
+                product_ids_by_description={_normalize_description(line.description): [candidate]},
+            )
+            workbook = load_workbook(output, data_only=False)
+            self.assertIsNone(workbook.active.cell(2, 1).value)
+            exception = workbook["Excepciones"]
+            self.assertIn("Código de barras no registrado en EFFI", exception.cell(2, 2).value)
+            self.assertIn(line.description, exception.cell(2, 2).value)
+            barcode_warning = next(warning for warning in warnings if "Código de barras" in warning)
+            self.assertIn(line.description, barcode_warning)
+            self.assertIn("vincular este código en EFFI", barcode_warning)
+            workbook.close()
+
     def test_maps_description_to_effi_product_id_when_barcode_missing(self) -> None:
         source = XML_DIR / "ad09013821010002600127292.xml"
         invoice = parse_invoice(source)
