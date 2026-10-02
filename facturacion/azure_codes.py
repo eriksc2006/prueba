@@ -4,6 +4,7 @@ import argparse
 import csv
 import os
 import re
+from collections import Counter
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
@@ -188,7 +189,7 @@ def get_product_ids_by_barcodes(barcodes: Iterable[str]) -> dict[str, Any]:
     if not codes:
         return {}
 
-    products: dict[str, Any] = {}
+    product_ids_by_code: dict[str, set[Any]] = {}
     with closing(_connect()) as connection:
         with closing(connection.cursor()) as cursor:
             for offset in range(0, len(codes), 2000):
@@ -202,8 +203,12 @@ def get_product_ids_by_barcodes(barcodes: Iterable[str]) -> dict[str, Any]:
                 cursor.execute(query, batch)
                 for barcode, product_id in cursor.fetchall():
                     if barcode is not None and product_id is not None:
-                        products.setdefault(str(barcode).strip(), product_id)
-    return products
+                        product_ids_by_code.setdefault(str(barcode).strip(), set()).add(product_id)
+    return {
+        barcode: next(iter(product_ids))
+        for barcode, product_ids in product_ids_by_code.items()
+        if len(product_ids) == 1
+    }
 
 
 def _normalize_description(value: str) -> str:
@@ -225,31 +230,57 @@ def get_product_candidates_by_descriptions(
         _normalize_description(description): _normalize_description(description).split()
         for description in unique_descriptions
     }
-    tokens = list(dict.fromkeys(
+    def is_searchable(token: str) -> bool:
+        return (
+            len(token) >= 3
+            or (any(character.isalpha() for character in token) and any(character.isdigit() for character in token))
+            or (token.isdigit() and len(token) >= 2)
+        )
+
+    token_frequency = Counter(
         token
         for description_tokens in normalized_descriptions.values()
-        for token in description_tokens
-        if len(token) >= 3
-        or (any(character.isalpha() for character in token) and any(character.isdigit() for character in token))
-        or (token.isdigit() and len(token) >= 2)
-    ))
+        for token in set(description_tokens)
+        if is_searchable(token)
+    )
+    selected_tokens = set()
+    for description_tokens in normalized_descriptions.values():
+        distinctive = sorted(
+            {token for token in description_tokens if is_searchable(token)},
+            key=lambda token: (token_frequency[token], -len(token), token),
+        )
+        selected_tokens.update(distinctive[:2])
+    tokens = sorted(
+        selected_tokens,
+        key=lambda token: (token_frequency[token], -len(token), token),
+    )[:160]
     if not tokens:
         return {}
 
     products: dict[Any, dict[str, Any]] = {}
+    search_fields = ("Nombre", "Referencia", "Marca", "Categoria")
+    token_batch_size = 400
     with closing(_connect()) as connection:
         with closing(connection.cursor()) as cursor:
-            cursor.execute("""
-                SELECT
-                    IdProducto, CodigoBarras, Nombre, Referencia, Categoria, Marca,
-                    PrecioConImpuestoTarifaNormal, PrecioConImpuestoTarifaMayorista
-                FROM [stg].[ProductoVerificador]
-                WHERE IdProducto IS NOT NULL
-            """)
-            columns = [column[0] for column in cursor.description]
-            for row in cursor.fetchall():
-                product = dict(zip(columns, row))
-                products.setdefault(product["IdProducto"], product)
+            for offset in range(0, len(tokens), token_batch_size):
+                batch = tokens[offset : offset + token_batch_size]
+                term_conditions = [
+                    "(" + " OR ".join(f"{field} LIKE ?" for field in search_fields) + ")"
+                    for _ in batch
+                ]
+                query = f"""
+                    SELECT
+                        IdProducto, CodigoBarras, Nombre, Referencia, Categoria, Marca,
+                        PrecioConImpuestoTarifaNormal, PrecioConImpuestoTarifaMayorista
+                    FROM [stg].[ProductoVerificador]
+                    WHERE IdProducto IS NOT NULL AND ({' OR '.join(term_conditions)})
+                """
+                patterns = [f"%{token}%" for token in batch for _ in search_fields]
+                cursor.execute(query, patterns)
+                columns = [column[0] for column in cursor.description]
+                for row in cursor.fetchall():
+                    product = dict(zip(columns, row))
+                    products.setdefault(product["IdProducto"], product)
 
     products_with_tokens = [
         (

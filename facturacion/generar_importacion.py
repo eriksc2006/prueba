@@ -428,6 +428,70 @@ def _import_amounts(line: InvoiceLine) -> tuple[Decimal, Decimal, Decimal]:
     return price, discount, source_delta
 
 
+def _is_full_discount_bonus(line: InvoiceLine) -> bool:
+    gross_amount = line.unit_price * line.quantity
+    return (
+        line.quantity > 0
+        and line.net_amount == 0
+        and gross_amount > 0
+        and line.discount_total > 0
+        and abs(gross_amount - line.discount_total) <= CENT
+    )
+
+
+def _group_import_lines(
+    invoice: Invoice,
+    product_ids_by_barcode: Mapping[str, Any] | None,
+    product_ids_by_description: Mapping[str, Any] | None,
+) -> list[tuple[InvoiceLine, ...]]:
+    grouped: dict[tuple[str, str, str], list[InvoiceLine]] = {}
+    for line in invoice.lines:
+        if line.barcode:
+            identity = ("barcode", line.barcode)
+        else:
+            product_id, _, _, _, resolved = _resolved_product(
+                line, product_ids_by_barcode, product_ids_by_description
+            )
+            if resolved and product_id is not None:
+                identity = ("effi", str(product_id))
+            elif line.item_code and line.item_code not in {"0", "-"}:
+                identity = ("item", line.item_code.strip().casefold())
+            else:
+                description = _normalize_description(line.description)
+                identity = ("description", description or line.line_id)
+        key = (*identity, line.unit.strip().casefold())
+        grouped.setdefault(key, []).append(line)
+
+    result: list[tuple[InvoiceLine, ...]] = []
+    for lines in grouped.values():
+        charged_tax_profiles = {
+            tuple(rate.normalize() for rate in line.tax_rates)
+            for line in lines
+            if line.net_amount != 0
+        }
+        can_allocate_bonus = (
+            len(lines) > 1
+            and all(line.quantity > 0 and line.net_amount >= 0 for line in lines)
+            and sum((line.net_amount for line in lines), Decimal("0")) > 0
+            and len(charged_tax_profiles) <= 1
+        )
+        if can_allocate_bonus:
+            result.append(tuple(lines))
+        else:
+            result.extend((line,) for line in lines)
+    return result
+
+
+def _import_group_amounts(lines: tuple[InvoiceLine, ...]) -> tuple[Decimal, Decimal, Decimal, InvoiceLine]:
+    tax_line = next((line for line in lines if line.net_amount != 0), lines[0])
+    if len(lines) == 1:
+        price, discount, source_delta = _import_amounts(lines[0])
+        return lines[0].quantity, price, discount, tax_line
+    quantity = sum((line.quantity for line in lines), Decimal("0"))
+    net_amount = sum((line.net_amount for line in lines), Decimal("0"))
+    return quantity, net_amount / quantity, Decimal("0"), tax_line
+
+
 def _line_warnings(
     line: InvoiceLine,
     mapping: dict[Decimal, int],
@@ -476,7 +540,7 @@ def _write_detail(
     tax_codes: dict[Decimal, int],
     product_ids_by_barcode: Mapping[str, Any] | None = None,
     product_ids_by_description: Mapping[str, Any] | None = None,
-) -> None:
+) -> tuple[dict[str, int], list[tuple[InvoiceLine, ...]]]:
     # The supplied workbook has sample lines in rows 2-4. Remove cell values
     # only; preserve the template's formatting and its header row.
     for row in sheet.iter_rows(min_row=2, max_row=max(sheet.max_row, len(invoice.lines) + 1), min_col=1, max_col=9):
@@ -484,21 +548,26 @@ def _write_detail(
             cell.value = None
 
     style_source = [sheet.cell(row=2, column=column) for column in range(1, 10)]
-    for row_number, line in enumerate(invoice.lines, start=2):
+    grouped_lines = _group_import_lines(invoice, product_ids_by_barcode, product_ids_by_description)
+    import_row_by_line: dict[str, int] = {}
+    for row_number, source_lines in enumerate(grouped_lines, start=2):
+        line = source_lines[0]
         resolved_id, _, _, _, _ = _resolved_product(
             line, product_ids_by_barcode, product_ids_by_description
         )
-        import_price, import_discount, _ = _import_amounts(line)
+        quantity, import_price, import_discount, tax_line = _import_group_amounts(source_lines)
+        for source_line in source_lines:
+            import_row_by_line[source_line.line_id] = row_number
         values = (
             resolved_id,                # A: EFFI article ID
             None,                       # B: EFFI expense-type ID (not in DIAN UBL)
             None,                       # C: lot (not in DIAN UBL)
             None,                       # D: serial (not in DIAN UBL)
             None,                       # E: observation (kept for manual entry)
-            line.quantity,              # F: quantity
+            quantity,                   # F: quantity
             import_price,               # G: unit price
             import_discount,            # H: total line discount
-            _tax_code(line, tax_codes), # I: configured EFFI tax ID
+            _tax_code(tax_line, tax_codes), # I: configured EFFI tax ID
         )
         for column, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_number, column=column, value=value)
@@ -506,6 +575,7 @@ def _write_detail(
                 cell._style = style_source[column - 1]._style
                 if style_source[column - 1].number_format:
                     cell.number_format = style_source[column - 1].number_format
+    return import_row_by_line, grouped_lines
 
 
 def _json_invoice(invoice: Invoice) -> dict[str, object]:
@@ -550,15 +620,31 @@ def generate_workbook(
     invoice = parse_invoice(source)
     workbook = load_workbook(template)
     sheet = workbook.active
-    _write_detail(sheet, invoice, tax_codes, product_ids_by_barcode, product_ids_by_description)
+    import_row_by_line, grouped_lines = _write_detail(
+        sheet, invoice, tax_codes, product_ids_by_barcode, product_ids_by_description
+    )
+    group_by_line = {
+        line.line_id: lines
+        for lines in grouped_lines
+        for line in lines
+    }
+    barcode_counts: dict[str, int] = {}
+    for line in invoice.lines:
+        if line.barcode:
+            barcode_counts[line.barcode] = barcode_counts.get(line.barcode, 0) + 1
     unresolved_lookup = product_ids_by_barcode is not None or product_ids_by_description is not None
     exceptions = []
     for line in invoice.lines:
         _, candidate, score, margin, resolved = _resolved_product(
             line, product_ids_by_barcode, product_ids_by_description
         )
+        source_group = group_by_line[line.line_id]
+        group_quantity, group_price, _, _ = _import_group_amounts(source_group)
+        grouped_bonus = len(source_group) > 1
+        repeated_barcode = bool(line.barcode and barcode_counts.get(line.barcode, 0) > 1)
+        full_discount_bonus = _is_full_discount_bonus(line)
         import_price, import_discount, source_delta = _import_amounts(line)
-        if (unresolved_lookup and not resolved) or source_delta or line.quantity <= 0:
+        if (unresolved_lookup and not resolved) or source_delta or line.quantity <= 0 or grouped_bonus or full_discount_bonus or repeated_barcode:
             reasons = []
             if unresolved_lookup and not resolved:
                 if line.barcode:
@@ -572,6 +658,15 @@ def generate_workbook(
                 reasons.append("Neto XML conciliado; revisar diferencia fuente")
             if line.quantity <= 0:
                 reasons.append("Cantidad no positiva")
+            if grouped_bonus:
+                reasons.append(
+                    f"Bonificación/prorrateo: {group_quantity} unidades totales; "
+                    f"costo unitario efectivo {group_price}"
+                )
+            if full_discount_bonus:
+                reasons.append("Bonificación 100% detectada; vincular al producto facturado correspondiente")
+            if repeated_barcode and not grouped_bonus:
+                reasons.append("GTIN repetido con perfiles o unidades separadas; revisar vínculo y bonificación")
             exceptions.append((line, candidate, score, margin, resolved, source_delta, import_discount, "; ".join(reasons)))
     if exceptions:
         exception_sheet = workbook.create_sheet("Excepciones")
@@ -580,10 +675,14 @@ def generate_workbook(
             "Presentación factura", "Precio unitario XML", "Descuento XML", "Neto XML", "Neto calculado XML",
             "Ajuste aplicado al descuento", "IdProducto candidato", "Nombre candidato",
             "Presentación candidato", "Referencia", "Marca", "Categoría", "Precio normal", "Precio mayorista",
-            "Puntaje", "Decisión",
+            "Puntaje", "Decisión", "Fila importación", "Unidades totales del producto",
+            "Neto agrupado", "Costo unitario efectivo", "Bonificación consolidada",
+            "Líneas XML consolidadas",
         ])
         for line, candidate, score, margin, resolved, source_delta, import_discount, reason in exceptions:
             nearest = candidate or {}
+            source_group = group_by_line[line.line_id]
+            group_quantity, group_price, _, _ = _import_group_amounts(source_group)
             exception_sheet.append([
                 line.line_id,
                 reason,
@@ -608,6 +707,12 @@ def generate_workbook(
                 nearest.get("PrecioConImpuestoTarifaMayorista"),
                 score,
                 "Usado" if resolved else f"Revisar; margen {margin:.0%}",
+                import_row_by_line[line.line_id],
+                group_quantity,
+                sum((source_line.net_amount for source_line in group_by_line[line.line_id]), Decimal("0")),
+                group_price,
+                len(group_by_line[line.line_id]) > 1,
+                ", ".join(source_line.line_id for source_line in group_by_line[line.line_id]),
             ])
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
@@ -618,11 +723,18 @@ def generate_workbook(
             json.dumps(_json_invoice(invoice), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    return [
+    warnings = [
         warning
         for line in invoice.lines
         for warning in _line_warnings(line, tax_codes, product_ids_by_barcode, product_ids_by_description)
     ]
+    warnings.extend(
+        f"Producto {lines[0].description or lines[0].item_code}: Bonificación consolidada; "
+        f"{_import_group_amounts(lines)[0]} unidades, costo efectivo {_import_group_amounts(lines)[1]} por unidad."
+        for lines in grouped_lines
+        if len(lines) > 1
+    )
+    return warnings
 
 
 def _sources(input_path: Path) -> list[Path]:
