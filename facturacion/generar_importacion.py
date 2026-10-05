@@ -364,6 +364,44 @@ def _candidate_score(line: InvoiceLine, product: Mapping[str, Any]) -> float:
     return sum(value * weight for value, weight in components) / total_weight
 
 
+def _variant_tokens(value: str) -> set[str]:
+    variants = re.findall(r"(?<!\d)\d{1,3}\s*[.,/-]\s*\d{1,3}[a-z]?(?!\d)", value or "", re.IGNORECASE)
+    return {
+        re.sub(r"\s+", "", variant).replace(",", ".").replace("/", ".").replace("-", ".").lower()
+        for variant in variants
+    }
+
+
+def _supplier_matches_product_brand(supplier_name: str, brand: str) -> bool:
+    legal_suffixes = {"s", "a", "sas", "ltda", "limitada", "inc", "llc", "corp", "corporation"}
+    supplier_tokens = [
+        token for token in _normalize_description(supplier_name).split()
+        if token not in legal_suffixes
+    ]
+    brand_tokens = _normalize_description(brand).split()
+    return bool(supplier_tokens and brand_tokens and "".join(supplier_tokens) == "".join(brand_tokens))
+
+
+def _confident_no_barcode_match(
+    line: InvoiceLine,
+    product: Mapping[str, Any],
+    margin: float,
+    supplier_name: str = "",
+) -> bool:
+    if line.barcode or product.get("IdProducto") is None or margin < 0.10:
+        return False
+    source_variants = _variant_tokens(line.description)
+    product_text = " ".join((str(product.get("Nombre") or ""), str(product.get("Referencia") or "")))
+    if not source_variants or not source_variants.intersection(_variant_tokens(product_text)):
+        return False
+    source_tokens = set(_normalize_description(line.description).split())
+    product_tokens = set(_normalize_description(product_text).split())
+    if not any(len(token) >= 5 for token in source_tokens & product_tokens):
+        return False
+    brand = str(product.get("Marca") or "")
+    return bool(brand and _supplier_matches_product_brand(supplier_name, brand))
+
+
 def _description_match(
     line: InvoiceLine,
     product_ids_by_description: Mapping[str, Any] | None,
@@ -394,10 +432,11 @@ def _resolved_product(
     line: InvoiceLine,
     product_ids_by_barcode: Mapping[str, Any] | None,
     product_ids_by_description: Mapping[str, Any] | None,
+    supplier_name: str = "",
 ) -> tuple[Any, Mapping[str, Any] | None, float, float, bool]:
     if line.barcode:
         if product_ids_by_barcode is None:
-            return line.item_code, None, 0.0, 0.0, False
+            return None, None, 0.0, 0.0, False
         barcode_product_id = product_ids_by_barcode.get(line.barcode)
         if barcode_product_id is not None:
             return barcode_product_id, None, 1.0, 1.0, True
@@ -406,12 +445,14 @@ def _resolved_product(
     accepted = bool(
         candidate
         and candidate.get("IdProducto") is not None
-        and score >= 0.72
-        and (margin >= 0.06 or margin == 1.0)
+        and (
+            (score >= 0.72 and (margin >= 0.06 or margin == 1.0))
+            or _confident_no_barcode_match(line, candidate, margin, supplier_name)
+        )
     )
     if accepted:
         return candidate["IdProducto"], candidate, score, margin, True
-    return line.item_code, candidate, score, margin, False
+    return None, candidate, score, margin, False
 
 
 def _import_amounts(line: InvoiceLine) -> tuple[Decimal, Decimal, Decimal]:
@@ -457,6 +498,9 @@ def _group_import_lines(
             elif line.item_code and line.item_code not in {"0", "-"}:
                 identity = ("item", line.item_code.strip().casefold())
             else:
+                # Never reuse the supplier's item reference as an EFFI article ID.
+                # It may group matching invoice lines, but is never written to the
+                # EFFI article column unless Azure verifies the product.
                 description = _normalize_description(line.description)
                 identity = ("description", description or line.line_id)
         key = (*identity, line.unit.strip().casefold())
@@ -497,6 +541,7 @@ def _line_warnings(
     mapping: dict[Decimal, int],
     product_ids_by_barcode: Mapping[str, Any] | None = None,
     product_ids_by_description: Mapping[str, Any] | None = None,
+    supplier_name: str = "",
 ) -> list[str]:
     warnings: list[str] = []
     label = f"línea {line.line_id or '?'}"
@@ -504,7 +549,7 @@ def _line_warnings(
         warnings.append(f"{label}: no se encontró código de artículo; completar en EFFI.")
     if product_ids_by_barcode is not None or product_ids_by_description is not None:
         _, _, score, margin, resolved = _resolved_product(
-            line, product_ids_by_barcode, product_ids_by_description
+            line, product_ids_by_barcode, product_ids_by_description, supplier_name
         )
         if not resolved:
             reason = (
@@ -548,19 +593,22 @@ def _write_detail(
             cell.value = None
 
     style_source = [sheet.cell(row=2, column=column) for column in range(1, 10)]
+    for row_number in range(2, max(sheet.max_row, len(invoice.lines) + 1) + 1):
+        for column in range(2, 6):
+            sheet.cell(row=row_number, column=column, value=None)
     grouped_lines = _group_import_lines(invoice, product_ids_by_barcode, product_ids_by_description)
     import_row_by_line: dict[str, int] = {}
     for row_number, source_lines in enumerate(grouped_lines, start=2):
         line = source_lines[0]
         resolved_id, _, _, _, _ = _resolved_product(
-            line, product_ids_by_barcode, product_ids_by_description
+            line, product_ids_by_barcode, product_ids_by_description, invoice.supplier_name
         )
         quantity, import_price, import_discount, tax_line = _import_group_amounts(source_lines)
         for source_line in source_lines:
             import_row_by_line[source_line.line_id] = row_number
         values = (
             resolved_id,                # A: EFFI article ID
-            None,                       # B: EFFI expense-type ID (not in DIAN UBL)
+            1 if not any(source_line.barcode for source_line in source_lines) else None,  # B: expense type
             None,                       # C: lot (not in DIAN UBL)
             None,                       # D: serial (not in DIAN UBL)
             None,                       # E: observation (kept for manual entry)
@@ -634,10 +682,13 @@ def generate_workbook(
             barcode_counts[line.barcode] = barcode_counts.get(line.barcode, 0) + 1
     unresolved_lookup = product_ids_by_barcode is not None or product_ids_by_description is not None
     exceptions = []
+    automatic_matches = []
     for line in invoice.lines:
         _, candidate, score, margin, resolved = _resolved_product(
-            line, product_ids_by_barcode, product_ids_by_description
+            line, product_ids_by_barcode, product_ids_by_description, invoice.supplier_name
         )
+        if not line.barcode and candidate and resolved:
+            automatic_matches.append((line, candidate, score, margin))
         source_group = group_by_line[line.line_id]
         group_quantity, group_price, _, _ = _import_group_amounts(source_group)
         grouped_bonus = len(source_group) > 1
@@ -674,7 +725,8 @@ def generate_workbook(
             "Línea", "Tipo", "Código de barras", "Descripción factura", "Cantidad",
             "Presentación factura", "Precio unitario XML", "Descuento XML", "Neto XML", "Neto calculado XML",
             "Ajuste aplicado al descuento", "IdProducto candidato", "Nombre candidato",
-            "Presentación candidato", "Referencia", "Marca", "Categoría", "Precio normal", "Precio mayorista",
+            "Código de barras candidato", "Presentación candidato", "Referencia", "Marca", "Categoría",
+            "Precio normal", "Precio mayorista",
             "Puntaje", "Decisión", "Fila importación", "Unidades totales del producto",
             "Neto agrupado", "Costo unitario efectivo", "Bonificación consolidada",
             "Líneas XML consolidadas",
@@ -697,6 +749,7 @@ def generate_workbook(
                 float(import_discount - line.discount_total),
                 nearest.get("IdProducto"),
                 nearest.get("Nombre"),
+                nearest.get("CodigoBarras"),
                 ", ".join(sorted(_presentation_tokens(
                     str(nearest.get("Nombre") or "") + " " + str(nearest.get("Referencia") or "")
                 ))),
@@ -714,6 +767,26 @@ def generate_workbook(
                 len(group_by_line[line.line_id]) > 1,
                 ", ".join(source_line.line_id for source_line in group_by_line[line.line_id]),
             ])
+    if automatic_matches:
+        match_sheet = workbook.create_sheet("Coincidencias automáticas")
+        match_sheet.append([
+            "Línea XML", "Descripción factura", "IdProducto EFFI", "Producto EFFI",
+            "Código de barras EFFI", "Referencia EFFI", "Marca EFFI", "Categoría EFFI",
+            "Puntaje", "Margen",
+        ])
+        for line, candidate, score, margin in automatic_matches:
+            match_sheet.append([
+                line.line_id,
+                line.description,
+                candidate.get("IdProducto"),
+                candidate.get("Nombre"),
+                candidate.get("CodigoBarras"),
+                candidate.get("Referencia"),
+                candidate.get("Marca"),
+                candidate.get("Categoria"),
+                score,
+                margin,
+            ])
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
     workbook.close()
@@ -726,7 +799,9 @@ def generate_workbook(
     warnings = [
         warning
         for line in invoice.lines
-        for warning in _line_warnings(line, tax_codes, product_ids_by_barcode, product_ids_by_description)
+        for warning in _line_warnings(
+            line, tax_codes, product_ids_by_barcode, product_ids_by_description, invoice.supplier_name
+        )
     ]
     warnings.extend(
         f"Producto {lines[0].description or lines[0].item_code}: Bonificación consolidada; "

@@ -4,10 +4,15 @@ import html
 import hashlib
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +32,10 @@ from facturacion.generar_importacion import (
     DEFAULT_XML_DIR,
     _is_full_discount_bonus,
     _group_import_lines,
+    _confident_no_barcode_match,
     _normalize_description,
     _presentation_tokens,
+    _variant_tokens,
     _safe_stem,
     generate_workbook,
     parse_invoice,
@@ -39,12 +46,35 @@ REVIEW_FILE = DEFAULT_OUTPUT_DIR / "revisiones_manuales.json"
 DETAIL_SHEET = "Hoja1"
 INVOICE_APPROVAL_KEY = "__invoice_approval__"
 INVOICE_APPROVAL_HISTORY_KEY = "__invoice_approval_history__"
+AUTOMATIC_MATCH_SHEET = "Coincidencias automáticas"
 
 
 def _display(value: Any, empty: str = "Sin dato") -> str:
     if value is None or str(value).strip().lower() in {"", "none"}:
         return empty
     return str(value)
+
+
+def _verified_article_id(value: Any, line: Any | None = None) -> Any:
+    """Only keep numeric EFFI IDs; supplier item references must never be exported."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate.isdigit():
+            return int(candidate)
+        if line is not None and candidate.casefold() == (line.item_code or "").strip().casefold():
+            return None
+        return None
+    return None
 
 
 def _money(value: Any) -> str:
@@ -61,6 +91,12 @@ def _money(value: Any) -> str:
         return f"COP $ {localized}"
     except Exception:
         return str(value)
+
+
+def _price_including_taxes(unit_cost: Decimal, tax_rates: tuple[Decimal, ...]) -> Decimal:
+    total_rate = sum(tax_rates, Decimal("0"))
+    gross_cost = unit_cost * (Decimal("1") + total_rate / Decimal("100"))
+    return gross_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _load_review_state() -> dict[str, Any]:
@@ -151,9 +187,29 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
     barcode_codes = tuple(sorted({
         line.barcode for invoice in invoices for line in invoice.lines if line.barcode
     }))
-    product_ids_by_barcode = _cached_barcode_product_ids(
-        barcode_codes
-    )
+    lookup_error = None
+    try:
+        product_ids_by_barcode = _cached_barcode_product_ids(barcode_codes)
+    except Exception as error:
+        lookup_error = str(error)
+        product_ids_by_barcode = {}
+        parsed_invoices = [
+            (source, invoice, output)
+            for source, invoice, output in parsed_invoices
+            if not output.is_file()
+            or source.stat().st_mtime > output.stat().st_mtime
+        ]
+        if not parsed_invoices:
+            return {
+                "generated": [],
+                "mapped_barcodes": 0,
+                "unmapped_barcodes": 0,
+                "lookup_error": lookup_error,
+            }
+        invoices = [invoice for _, invoice, _ in parsed_invoices]
+        barcode_codes = tuple(sorted({
+            line.barcode for invoice in invoices for line in invoice.lines if line.barcode
+        }))
     product_ids_by_description: dict[str, Any] = {}
     generated_sources = []
     for source, invoice, output in parsed_invoices:
@@ -186,6 +242,7 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
         "generated": generated_sources,
         "mapped_barcodes": mapped_barcodes,
         "unmapped_barcodes": len(set(all_barcodes)) - mapped_barcodes,
+        "lookup_error": lookup_error,
     }
 
 
@@ -199,8 +256,11 @@ def _invoice_review_complete(queue_item: dict[str, Any], invoice_reviews: dict[s
 
 def _requires_human_decision(exception: dict[str, Any]) -> bool:
     reason = str(exception.get("Tipo") or "")
+    if exception.get("_automatic_match"):
+        reason = re.sub(r"Sin coincidencia confiable|Candidato cercano; validar identidad", "", reason)
+        reason = reason.strip(" ;")
     if not reason:
-        return True
+        return not exception.get("_automatic_match")
     review_markers = (
         "no registrado en EFFI",
         "Sin coincidencia confiable",
@@ -283,6 +343,24 @@ def _read_exception_rows(path: Path) -> list[dict[str, Any]]:
         workbook.close()
 
 
+def _read_automatic_match_rows(path: Path) -> list[dict[str, Any]]:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet_name = "Coincidencias automáticas"
+        if sheet_name not in workbook.sheetnames:
+            return []
+        sheet = workbook[sheet_name]
+        rows = sheet.iter_rows(values_only=True)
+        headers = [str(value).strip() if value is not None else "" for value in next(rows, ())]
+        return [
+            dict(zip(headers, values))
+            for values in rows
+            if values and values[0] is not None
+        ]
+    finally:
+        workbook.close()
+
+
 def _invoice_queue() -> list[dict[str, Any]]:
     files = sorted(DEFAULT_XML_DIR.glob("*.xml")) + sorted(DEFAULT_OUTPUT_DIR.glob("*_effi.xlsx"))
     signature = []
@@ -309,6 +387,7 @@ def _build_invoice_queue() -> list[dict[str, Any]]:
             continue
         output = DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
         exceptions = _read_exception_rows(output) if output.is_file() else []
+        automatic_matches = _read_automatic_match_rows(output) if output.is_file() else []
         import_row_by_line = {
             str(line.line_id): row for row, line in enumerate(invoice.lines, start=2)
         }
@@ -345,10 +424,11 @@ def _build_invoice_queue() -> list[dict[str, Any]]:
                     line_id = str(line.line_id)
                     if line_id not in mapped_line_ids:
                         import_row_by_line[line_id] = next(remaining_rows, import_row_by_line[line_id])
+                line_by_id = {str(line.line_id): line for line in invoice.lines}
                 product_data_by_line = {
                     line_id: {
                         "import_row": row,
-                        "article_id": detail.cell(row=row, column=1).value,
+                        "article_id": _verified_article_id(detail.cell(row=row, column=1).value, line_by_id.get(line_id)),
                         "quantity": detail.cell(row=row, column=6).value,
                         "unit_price": detail.cell(row=row, column=7).value,
                         "discount": detail.cell(row=row, column=8).value,
@@ -372,7 +452,7 @@ def _build_invoice_queue() -> list[dict[str, Any]]:
                 quantity = sum((line.quantity for line in lines), Decimal("0"))
                 net_total = sum((line.net_amount for line in lines), Decimal("0"))
                 is_grouped = len(lines) > 1
-                article_id = lines[0].item_code or None
+                article_id = None
                 for line in lines:
                     product_data_by_line[str(line.line_id)] = {
                         "import_row": import_row,
@@ -386,7 +466,69 @@ def _build_invoice_queue() -> list[dict[str, Any]]:
                 line_id: values["article_id"]
                 for line_id, values in product_data_by_line.items()
             }
+        line_by_id = {str(line.line_id): line for line in invoice.lines}
         exceptions_by_line = {str(item.get("Línea")): item for item in exceptions}
+        normalized_matches = []
+        matched_line_ids = set()
+        for match in automatic_matches:
+            line_id = str(match.get("Línea XML") or "")
+            product_id = match.get("IdProducto EFFI")
+            if not line_id or product_id is None:
+                continue
+            normalized_match = {
+                "line_id": line_id,
+                "description": match.get("Descripción factura") or "",
+                "product_id": product_id,
+                "product_name": match.get("Producto EFFI") or "",
+                "barcode": match.get("Código de barras EFFI") or "",
+                "reference": match.get("Referencia EFFI") or "",
+                "brand": match.get("Marca EFFI") or "",
+                "category": match.get("Categoría EFFI") or "",
+                "score": match.get("Puntaje"),
+                "margin": match.get("Margen"),
+            }
+            normalized_matches.append(normalized_match)
+            matched_line_ids.add(line_id)
+            if line_id in exceptions_by_line:
+                exceptions_by_line[line_id]["_automatic_match"] = True
+        for exception in exceptions:
+            line_id = str(exception.get("Línea") or "")
+            line = line_by_id.get(line_id)
+            if not line or line.barcode or line_id in matched_line_ids:
+                continue
+            candidate = {
+                "IdProducto": exception.get("IdProducto candidato"),
+                "Nombre": exception.get("Nombre candidato"),
+                "CodigoBarras": exception.get("Código de barras candidato"),
+                "Referencia": exception.get("Referencia"),
+                "Marca": exception.get("Marca"),
+                "Categoria": exception.get("Categoría"),
+            }
+            margin_text = str(exception.get("Decisión") or "")
+            margin_match = re.search(r"margen\s+(\d+(?:[.,]\d+)?)%", margin_text, re.IGNORECASE)
+            margin = float(margin_match.group(1).replace(",", ".")) / 100 if margin_match else 1.0
+            if not _confident_no_barcode_match(line, candidate, margin, invoice.supplier_name):
+                continue
+            match = {
+                "line_id": line_id,
+                "description": line.description,
+                "product_id": candidate["IdProducto"],
+                "product_name": candidate["Nombre"] or "",
+                "barcode": candidate["CodigoBarras"] or "",
+                "reference": candidate["Referencia"] or "",
+                "brand": candidate["Marca"] or "",
+                "category": candidate["Categoria"] or "",
+                "score": exception.get("Puntaje"),
+                "margin": margin,
+            }
+            normalized_matches.append(match)
+            matched_line_ids.add(line_id)
+            exception["_automatic_match"] = True
+        for match in normalized_matches:
+            line_id = match["line_id"]
+            article_ids[line_id] = match["product_id"]
+            if line_id in product_data_by_line:
+                product_data_by_line[line_id]["article_id"] = match["product_id"]
         queue.append({
             "source": source,
             "invoice": invoice,
@@ -397,6 +539,7 @@ def _build_invoice_queue() -> list[dict[str, Any]]:
             "import_row_by_line": import_row_by_line,
             "article_ids": article_ids,
             "product_data_by_line": product_data_by_line,
+            "automatic_matches": normalized_matches,
         })
     return queue
 
@@ -407,6 +550,7 @@ def _product_from_exception(item: dict[str, Any]) -> dict[str, Any] | None:
         return None
     return {
         "IdProducto": product_id,
+        "CodigoBarras": item.get("Código de barras candidato"),
         "Nombre": item.get("Nombre candidato"),
         "Referencia": item.get("Referencia"),
         "Marca": item.get("Marca"),
@@ -480,6 +624,29 @@ def _line_product_key(line: Any) -> tuple[str, str]:
     return "description", _normalize_description(line.description)
 
 
+def _same_product_for_bonus(
+    bonus_line: Any,
+    paid_line: Any,
+    invoice_reviews: dict[str, Any] | None = None,
+    product_ids_by_line: dict[str, Any] | None = None,
+) -> bool:
+    invoice_reviews = invoice_reviews or {}
+    product_ids_by_line = product_ids_by_line or {}
+
+    def product_id(line: Any) -> Any:
+        line_id = str(line.line_id)
+        reviewed_id = invoice_reviews.get(line_id, {}).get("product_id")
+        if reviewed_id is not None:
+            return reviewed_id
+        return product_ids_by_line.get(line_id)
+
+    bonus_product_id = product_id(bonus_line)
+    paid_product_id = product_id(paid_line)
+    if bonus_product_id is not None and paid_product_id is not None:
+        return str(bonus_product_id) == str(paid_product_id)
+    return _line_product_key(bonus_line) == _line_product_key(paid_line)
+
+
 def _suggest_bonus_link(line: Any, invoice: Any) -> str | None:
     if line.net_amount != 0:
         return None
@@ -522,6 +689,52 @@ def _bonus_cost_summary(source_lines: list[Any], bonus_line_ids: set[str]) -> di
     }
 
 
+def _render_f2_keyboard_handler() -> None:
+        st.components.v1.html(
+                r"""
+                <script>
+                (() => {
+                    try {
+                        const app = window.parent;
+                        if (app.__effiF2TaxHandler) return;
+                        app.__effiF2TaxHandler = true;
+                        app.document.addEventListener("keydown", (event) => {
+                            if (event.key !== "F2") return;
+                                  const widget = event.target.closest('[data-testid="stNumberInput"]');
+                                  const label = widget && widget.querySelector("label");
+                            if (!label || !/Costo unitario|Costo prorrateado/.test(label.innerText)) return;
+                                  const input = widget.querySelector('[data-testid="stNumberInputField"]');
+                                  if (!input) return;
+                                  const inputWrapper = widget.closest('[data-testid="stElementContainer"]');
+                            const widgetKey = [...(inputWrapper?.classList || [])]
+                                .find((name) => name.startsWith("st-key-regular_cost_") || name.startsWith("st-key-bonus_cost_"));
+                            const keyParts = widgetKey?.split("_") || [];
+                            const lineId = widgetKey?.startsWith("st-key-bonus_cost_")
+                                ? keyParts[keyParts.length - 2]
+                                : keyParts[keyParts.length - 1];
+                            const preview = app.document.getElementById(`f2-tax-preview-${lineId}`);
+                            const basePrice = Number(input.value.replace(/\s/g, "").replace(",", "."));
+                            if (!preview || !Number.isFinite(basePrice)) return;
+                            const rates = (preview.dataset.taxRates || "")
+                                .split(",").map(Number).filter(Number.isFinite);
+                            const totalRate = rates.reduce((sum, rate) => sum + rate, 0);
+                            const total = (basePrice * (1 + totalRate / 100)).toLocaleString("es-CO", {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                            });
+                            const taxText = rates.length ? rates.map((rate) => `${rate}%`).join(" + ") : "sin impuestos";
+                            preview.textContent = `Precio con impuestos COP $ ${total} · Impuesto(s): ${taxText}`;
+                            preview.hidden = false;
+                            event.preventDefault();
+                        }, true);
+                    } catch (_) {}
+                })();
+                </script>
+                """,
+                height=0,
+        )
+
+
 def _render_cost_editor(
     source: Path,
     invoice: Any,
@@ -538,12 +751,17 @@ def _render_cost_editor(
     default_cost = Decimal(str(saved_review.get("final_unit_cost", product_row["effective_cost"])))
     suggested_link = _suggest_bonus_link(line, invoice)
     default_bonus = saved_review.get("is_bonus", line.net_amount == 0 and suggested_link is not None)
+    product_ids_by_line = {
+        candidate_line_id: row.get("article_id")
+        for candidate_line_id, row in product_row_by_line.items()
+    }
     paid_line_ids = [
         str(paid_line.line_id)
         for paid_line in invoice.lines
         if str(paid_line.line_id) != line_id
         and paid_line.net_amount > 0
         and not invoice_reviews.get(str(paid_line.line_id), {}).get("is_bonus")
+        and _same_product_for_bonus(line, paid_line, invoice_reviews, product_ids_by_line)
     ]
     saved_link = saved_review.get("bonus_link_line") or suggested_link
     default_link_index = paid_line_ids.index(saved_link) if saved_link in paid_line_ids else 0
@@ -595,18 +813,45 @@ def _render_cost_editor(
     elif is_bonus:
         validation_error = "No hay producto pagado disponible para vincular la bonificación."
 
+    tax_line = line_by_id.get(bonus_link_line) if is_bonus and bonus_link_line else line
+    tax_rates_for_preview = tax_line.tax_rates if tax_line is not None else line.tax_rates
     output_cost = allocation["effective_unit_cost"] if is_bonus and allocation else default_cost
     cost_column, summary_column = st.columns([1.15, 1])
     with cost_column:
-        final_cost = st.number_input(
-            "Costo unitario (COP)" if not is_bonus else "Costo prorrateado (COP / und.)",
-            min_value=0.0,
-            value=float(output_cost),
-            step=0.01,
-            format="%.6f",
-            key=(f"bonus_cost_{source.name}_{line_id}_{bonus_link_line}" if is_bonus else f"regular_cost_{source.name}_{line_id}"),
-            disabled=is_bonus,
+        price_column, tax_action_column = st.columns([1.5, 1])
+        with price_column:
+            final_cost = st.number_input(
+                "Costo unitario (COP)" if not is_bonus else "Costo prorrateado (COP / und.)",
+                min_value=0.0,
+                value=float(output_cost),
+                step=0.01,
+                format="%.6f",
+                key=(f"bonus_cost_{source.name}_{line_id}_{bonus_link_line}" if is_bonus else f"regular_cost_{source.name}_{line_id}"),
+                disabled=is_bonus,
+            )
+        with tax_action_column:
+            include_taxes = st.button(
+                "F2 · Impuestos",
+                key=f"include_taxes_{source.name}_{line_id}",
+                help="Calcula el precio total con los impuestos de esta línea. El costo guardado sigue siendo antes de impuestos.",
+                use_container_width=True,
+            )
+        preview_id = f"f2-tax-preview-{html.escape(line_id, quote=True)}"
+        tax_rates_attribute = html.escape(",".join(str(rate) for rate in tax_rates_for_preview), quote=True)
+        st.markdown(
+            f'<div id="{preview_id}" data-tax-rates="{tax_rates_attribute}" hidden></div>',
+            unsafe_allow_html=True,
         )
+        tax_preview_key = f"tax_preview_{source.name}_{line_id}"
+        if include_taxes:
+            st.session_state[tax_preview_key] = True
+        if st.session_state.get(tax_preview_key):
+            tax_description = ", ".join(f"{rate}%" for rate in tax_rates_for_preview) or "sin impuestos"
+            st.metric(
+                "Precio con impuestos",
+                _money(_price_including_taxes(Decimal(str(final_cost)), tax_rates_for_preview)),
+            )
+            st.caption(f"Precio base {_money(final_cost)} · Impuesto(s): {tax_description}")
     with summary_column:
         if is_bonus and allocation:
             st.metric("Unidades del grupo", allocation["total_quantity"])
@@ -719,6 +964,27 @@ def _product_review_status(
         for line_id in reviewable_ids
     )
     return "Revisado por persona" if completed else "Requiere revisión"
+
+
+def _product_cost_editor_line_ids(
+    product_row: dict[str, Any],
+    exceptions_by_line: dict[str, dict[str, Any]],
+    invoice_reviews: dict[str, Any],
+    line_by_id: dict[str, Any] | None = None,
+) -> list[str]:
+    editor_line_ids = []
+    for line_id in product_row["line_ids"]:
+        exception = exceptions_by_line.get(line_id)
+        review = invoice_reviews.get(line_id, {})
+        line = (line_by_id or {}).get(line_id)
+        if (
+            (exception is not None and _requires_human_decision(exception))
+            or review.get("is_bonus")
+            or review.get("final_unit_cost") is not None
+            or bool(line and (line.net_amount == 0 or _is_full_discount_bonus(line)))
+        ):
+            editor_line_ids.append(line_id)
+    return editor_line_ids
 
 
 def _pending_review_count(queue_item: dict[str, Any], invoice_reviews: dict[str, Any]) -> int:
@@ -903,6 +1169,136 @@ def _next_pending_invoice_index(
     return None
 
 
+def _apply_automatic_matches(workbook: Any, queue_item: dict[str, Any]) -> None:
+    detail = workbook[DETAIL_SHEET] if DETAIL_SHEET in workbook.sheetnames else workbook.active
+    for match in queue_item.get("automatic_matches", []):
+        row = queue_item["import_row_by_line"].get(match["line_id"])
+        if row is not None and match.get("product_id") is not None:
+            detail.cell(row=int(row), column=1, value=match["product_id"])
+
+    if AUTOMATIC_MATCH_SHEET in workbook.sheetnames:
+        del workbook[AUTOMATIC_MATCH_SHEET]
+    matches = queue_item.get("automatic_matches", [])
+    if not matches:
+        return
+    sheet = workbook.create_sheet(AUTOMATIC_MATCH_SHEET)
+    sheet.append([
+        "Línea XML", "Fila Excel", "Descripción factura", "IdProducto EFFI", "Producto EFFI",
+        "Presentación", "Referencia", "Marca", "Categoría", "Código de barras EFFI", "Puntaje", "Margen",
+    ])
+    for match in matches:
+        product_text = f"{match.get('product_name') or ''} {match.get('reference') or ''}"
+        presentation = _presentation_tokens(product_text) or _variant_tokens(product_text)
+        sheet.append([
+            match["line_id"],
+            queue_item["import_row_by_line"].get(match["line_id"]),
+            match.get("description"),
+            match.get("product_id"),
+            match.get("product_name"),
+            ", ".join(sorted(presentation)),
+            match.get("reference"),
+            match.get("brand"),
+            match.get("category"),
+            match.get("barcode") or None,
+            match.get("score"),
+            match.get("margin"),
+        ])
+
+
+def _draft_workbook_data(
+    queue_item: dict[str, Any], invoice_reviews: dict[str, Any]
+) -> bytes | None:
+    original = queue_item.get("output")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary_original = Path(temporary_directory) / (
+            original.name
+            if original is not None
+            else f"{_safe_stem(queue_item['source'], queue_item['invoice'].invoice_id)}_effi.xlsx"
+        )
+        if original is not None and original.is_file():
+            shutil.copyfile(original, temporary_original)
+        else:
+            generate_workbook(
+                queue_item["source"],
+                DEFAULT_TEMPLATE,
+                temporary_original,
+                DEFAULT_TAX_CODES,
+            )
+        draft_queue = {**queue_item, "output": temporary_original}
+        draft_path = _reviewed_workbook(
+            draft_queue,
+            _draft_invoice_reviews(draft_queue, invoice_reviews),
+        )
+        return draft_path.read_bytes()
+
+
+def _draft_invoice_reviews(
+    queue_item: dict[str, Any], invoice_reviews: dict[str, Any]
+) -> dict[str, Any]:
+    draft_reviews = {
+        key: dict(value) if isinstance(value, dict) else value
+        for key, value in invoice_reviews.items()
+    }
+    invoice = queue_item["invoice"]
+    source_name = queue_item["source"].name
+    line_by_id = {str(line.line_id): line for line in invoice.lines}
+    session_state = st.session_state
+
+    for line in invoice.lines:
+        line_id = str(line.line_id)
+        saved_review = draft_reviews.get(line_id, {})
+        if not isinstance(saved_review, dict):
+            saved_review = {}
+        suggested_link = _suggest_bonus_link(line, invoice)
+        default_bonus = saved_review.get(
+            "is_bonus", line.net_amount == 0 and suggested_link is not None
+        )
+        is_bonus = bool(session_state.get(f"is_bonus_{source_name}_{line_id}", default_bonus))
+        review = {**saved_review, "is_bonus": is_bonus}
+        if not is_bonus:
+            review["bonus_link_line"] = None
+            draft_reviews[line_id] = review
+            continue
+
+        link_line_id = str(session_state.get(
+            f"bonus_link_{source_name}_{line_id}",
+            saved_review.get("bonus_link_line") or suggested_link or "",
+        ))
+        paid_line = line_by_id.get(link_line_id)
+        if (
+            paid_line is not None
+            and paid_line.net_amount > 0
+            and _same_product_for_bonus(
+                line,
+                paid_line,
+                draft_reviews,
+                queue_item.get("article_ids", {}),
+            )
+        ):
+            review["bonus_link_line"] = link_line_id
+            draft_reviews[line_id] = review
+
+    return draft_reviews
+
+
+def _automatic_match_table_rows(queue_item: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for match in queue_item.get("automatic_matches", []):
+        product_text = f"{match.get('product_name') or ''} {match.get('reference') or ''}"
+        presentation = _presentation_tokens(product_text) or _variant_tokens(product_text)
+        rows.append({
+            "Línea": match["line_id"],
+            "Descripción factura": match.get("description") or "",
+            "IdProducto EFFI": match.get("product_id"),
+            "Producto EFFI": match.get("product_name") or "",
+            "Presentación / variante": ", ".join(sorted(presentation)) or "Sin dato",
+            "Referencia": match.get("reference") or "",
+            "Marca": match.get("brand") or "",
+            "Código de barras EFFI": match.get("barcode") or "Pendiente de actualizar catálogo",
+        })
+    return rows
+
+
 def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> Path:
     invoice = queue_item["invoice"]
     source = queue_item["source"]
@@ -920,6 +1316,16 @@ def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> 
     }
     if not line_rows:
         line_rows = {str(line.line_id): row for row, line in enumerate(invoice.lines, start=2)}
+    line_by_id = {str(line.line_id): line for line in invoice.lines}
+    for line_id, row in line_rows.items():
+        article_value = queue_item.get("article_ids", {}).get(line_id)
+        if article_value is None:
+            sheet.cell(row=row, column=1).value = None
+        else:
+            sanitized = _verified_article_id(article_value, line_by_id.get(line_id))
+            if sanitized is None and sheet.cell(row=row, column=1).value is not None:
+                sheet.cell(row=row, column=1).value = None
+    _apply_automatic_matches(workbook, queue_item)
     for exception in _read_exception_rows(original):
         try:
             import_row = int(exception.get("Fila importación"))
@@ -927,6 +1333,12 @@ def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> 
             continue
         if import_row >= 2:
             line_rows[str(exception.get("Línea"))] = import_row
+    line_ids_by_row: dict[int, list[str]] = {}
+    for line_id, row in line_rows.items():
+        line_ids_by_row.setdefault(row, []).append(line_id)
+    for row, line_ids in line_ids_by_row.items():
+        has_barcode = any(line_by_id[line_id].barcode for line_id in line_ids if line_id in line_by_id)
+        sheet.cell(row=row, column=2, value=None if has_barcode else 1)
     row_reviews: dict[int, dict[str, Any]] = {}
     for line_id, review in approved.items():
         row = line_rows.get(str(line_id))
@@ -947,11 +1359,6 @@ def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> 
         elif review.get("status") == "no_match":
             sheet.cell(row=row, column=1).value = None
 
-    line_by_id = {str(line.line_id): line for line in invoice.lines}
-    line_ids_by_row: dict[int, list[str]] = {}
-    for line_id, row in line_rows.items():
-        line_ids_by_row.setdefault(row, []).append(line_id)
-
     bonus_links: dict[int, list[str]] = {}
     bonus_rows: set[int] = set()
     for line_id, review in approved.items():
@@ -962,6 +1369,13 @@ def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> 
         bonus_row = line_rows.get(str(line_id))
         if target_row is None or bonus_row is None or target_line_id == str(line_id):
             raise ValueError(f"La bonificación de la línea {line_id} no tiene un producto pagado válido vinculado.")
+        if not _same_product_for_bonus(
+            line_by_id[str(line_id)],
+            line_by_id[target_line_id],
+            approved,
+            queue_item.get("article_ids", {}),
+        ):
+            raise ValueError(f"La bonificación de la línea {line_id} está vinculada a un producto incompatible.")
         bonus_links.setdefault(target_row, []).append(str(line_id))
         if bonus_row != target_row:
             bonus_rows.add(bonus_row)
@@ -1108,6 +1522,7 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     _render_styles()
+    _render_f2_keyboard_handler()
     st.markdown(
         '<div class="app-topbar"><span></span><span class="app-topbar-title">Facturas</span>'
         '<span class="app-topbar-user" title="Revisión EFFI">E</span></div>',
@@ -1116,9 +1531,32 @@ def main() -> None:
     st.markdown('<div class="page-eyebrow">Operación diaria</div>', unsafe_allow_html=True)
     st.markdown('<h1>Bandeja de facturas</h1>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="page-subtitle">Modo Human on the loop: el sistema propone y el revisor decide; la sincronización es manual para no bloquear la cola.</p>',
+        '<p class="page-subtitle">Modo Human on the loop: el sistema propone, procesa y genera las facturas automáticamente; solo las excepciones quedan para decisión humana.</p>',
         unsafe_allow_html=True,
     )
+
+    if not st.session_state.get("invoice_auto_generation_checked_v2"):
+        spinner_factory = getattr(st, "spinner", None)
+        spinner = spinner_factory("Procesando facturas y resolviendo GTIN automáticos...") if callable(spinner_factory) else nullcontext()
+        context = (
+            spinner
+            if callable(getattr(spinner, "__enter__", None)) and callable(getattr(spinner, "__exit__", None))
+            else nullcontext()
+        )
+        try:
+            with context:
+                initial_sync = _sync_invoice_workbooks(force=True)
+            if initial_sync["generated"]:
+                st.session_state["invoice_sync_notice"] = (
+                    f'{len(initial_sync["generated"])} factura(s) procesada(s); '
+                    f'{initial_sync["mapped_barcodes"]} GTIN resuelto(s) automáticamente; '
+                    f'{initial_sync["unmapped_barcodes"]} GTIN pendiente(s) de vincular.'
+                )
+            if initial_sync.get("lookup_error"):
+                st.session_state["invoice_sync_error"] = initial_sync["lookup_error"]
+        except Exception as error:
+            st.session_state["invoice_sync_error"] = str(error)
+        st.session_state["invoice_auto_generation_checked_v2"] = True
 
     sync_notice = st.session_state.pop("invoice_sync_notice", None)
     sync_error = st.session_state.pop("invoice_sync_error", None)
@@ -1312,7 +1750,7 @@ def main() -> None:
     approver_key = f"approver_{source.name}"
     approver = str(st.session_state.get(approver_key, reviewer_name))
 
-    sync_column, generate_column = st.columns(2, gap="small")
+    sync_column, download_column = st.columns(2, gap="small")
     with sync_column:
         if st.button("⟳  Sincronizar", use_container_width=True, key="sync_queue"):
             try:
@@ -1321,18 +1759,42 @@ def main() -> None:
                 st.session_state["invoice_sync_notice"] = (
                     f'{len(sync_result["generated"])} factura(s) actualizada(s); '
                     f'{sync_result["mapped_barcodes"]} GTIN asignado(s), '
-                    f'{sync_result["unmapped_barcodes"]} pendiente(s) de excepción.'
+                    f'{sync_result["unmapped_barcodes"]} GTIN pendiente(s) de vincular.'
                 )
+                if sync_result.get("lookup_error"):
+                    st.session_state["invoice_sync_error"] = sync_result["lookup_error"]
             except Exception as error:
                 st.session_state["invoice_sync_error"] = str(error)
             st.rerun()
-    with generate_column:
-        if st.button(
-            "↓  Generar Excel revisado",
-            type="primary",
+    if invoice_ready:
+        completed_workbook = _draft_workbook_data(queue_item, invoice_reviews)
+        if completed_workbook is not None:
+            download_column.download_button(
+                "↓  Descargar Excel completo",
+                data=completed_workbook,
+                file_name=f"{_safe_stem(source, invoice.invoice_id)}_revisado.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"complete_download_{source.name}",
+                help="Descarga el Excel completo de esta factura con las decisiones revisadas.",
+            )
+        else:
+            download_column.warning("No se pudo preparar el Excel de esta factura.")
+    else:
+        download_column.button(
+            "↓  Descargar Excel completo",
             use_container_width=True,
-            disabled=not invoice_ready or (not approval_is_current and not approver.strip()),
-            key="generate_approved_workbook",
+            disabled=True,
+            key=f"complete_download_disabled_{source.name}",
+            help="Se habilita al terminar la revisión de esta factura.",
+        )
+    if invoice_ready and not approval_is_current:
+        approver = st.text_input("Nombre de quien aprueba", value=reviewer_name, key=approver_key)
+        if st.button(
+            "Registrar aprobación",
+            type="primary",
+            disabled=not approver.strip(),
+            key="register_invoice_approval",
         ):
             try:
                 final_reviews = {
@@ -1349,13 +1811,11 @@ def main() -> None:
                     _record_invoice_approval(review_state, source, invoice_reviews, approver)
                 st.rerun()
             except Exception as error:
-                st.error(f"No se pudo aprobar la factura ni generar el Excel final: {error}")
-    if invoice_ready and not approval_is_current:
-        approver = st.text_input("Nombre de quien aprueba", value=reviewer_name, key=approver_key)
+                st.error(f"No se pudo registrar la aprobación de la factura: {error}")
     if not invoice_ready:
-        st.caption("Resuelve todas las excepciones para habilitar la aprobación final.")
+        st.caption("Resuelve todas las excepciones para habilitar la descarga del Excel completo.")
     elif not approval_is_current:
-        st.caption("La aprobación registra responsable, hora y versión de los datos revisados.")
+        st.caption("La descarga está disponible. Registra también el nombre del aprobador para guardar la aprobación y su trazabilidad.")
 
     st.markdown(
         '<div class="summary-grid">'
@@ -1387,7 +1847,7 @@ def main() -> None:
         "Filtrar por proveedor", ["Todos los proveedores"] + sorted(set(suppliers)), key="invoice_supplier_filter"
     )
     date_filter = date_column.selectbox(
-        "Filtrar por fecha", ("Últimos 30 días", "Hoy", "Esta semana", "Todas las fechas"), key="invoice_date_filter"
+        "Filtrar por fecha", ("Todas las fechas", "Últimos 30 días", "Hoy", "Esta semana"), key="invoice_date_filter_v2"
     )
     dashboard_rows = []
     for invoice_index, item in enumerate(queue):
@@ -1468,13 +1928,123 @@ def main() -> None:
     human_review_indexes = [
         index for index, exception in enumerate(exceptions)
         if _requires_human_decision(exception)
+        and invoice_reviews.get(str(exception.get("Línea")), {}).get("status") not in {"confirmed", "no_match"}
     ]
     if cursor_key not in st.session_state:
         st.session_state[cursor_key] = _next_pending_index(exceptions, invoice_reviews, 0) or 0
     current_index = min(max(int(st.session_state[cursor_key]), 0), max(len(exceptions) - 1, 0))
 
-    st.markdown(f"## Excepciones · Factura {invoice.invoice_id}")
+    step_key = f"invoice_step_{source.name}"
+    current_step = st.session_state.get(step_key, "lote")
+
+    st.markdown(f"## Revisión · Factura {invoice.invoice_id}")
     st.caption(f"Proveedor: {invoice.supplier_name or 'Sin nombre'} · Fecha: {invoice.issue_date or 'Sin fecha'}")
+
+    if current_step == "lote":
+        st.markdown("### Paso 1 · Vista general del Excel")
+        lote_rows = []
+        alert_rows = []
+        for product_row in product_rows:
+            line_ids = product_row["line_ids"]
+            alert_text = "Sin alerta"
+            for line_id in line_ids:
+                exception = queue_item["exceptions_by_line"].get(line_id)
+                if exception and _requires_human_decision(exception):
+                    alert_text = str(exception.get("Tipo") or "Excepción de revisión")
+                    break
+            lote_rows.append({
+                "Línea": ", ".join(line_ids),
+                "Producto": str(product_row.get("description") or ""),
+                "Código": str(product_row.get("barcode") or ""),
+                "Cantidad": str(product_row.get("quantity")),
+                "Neto": _money(product_row.get("net_total")),
+                "Costo": _money(product_row.get("effective_cost")),
+                "Bonificación": "Sí" if product_row.get("bonus") else "No",
+                "Alerta": alert_text,
+                "Estado": _product_review_status(product_row, queue_item["exceptions_by_line"], invoice_reviews),
+            })
+            if alert_text != "Sin alerta":
+                alert_rows.append({
+                    "Línea": ", ".join(line_ids),
+                    "Producto": str(product_row.get("description") or ""),
+                    "Código": str(product_row.get("barcode") or ""),
+                    "Alerta": alert_text,
+                })
+        st.dataframe(lote_rows, use_container_width=True, hide_index=True)
+        if alert_rows:
+            st.warning("Hay excepciones por código de barras o coincidencias no fiables:")
+            st.dataframe(alert_rows, use_container_width=True, hide_index=True)
+        else:
+            st.success("No hay alertas por código de barras; la automatización ha resuelto el lote.")
+
+        relevant_cost_rows = []
+        for product_row in product_rows:
+            editor_line_ids = _product_cost_editor_line_ids(
+                product_row, queue_item["exceptions_by_line"], invoice_reviews, line_by_id
+            )
+            if not editor_line_ids:
+                continue
+            relevant_cost_rows.append((product_row, editor_line_ids))
+
+        if relevant_cost_rows:
+            with st.expander("Costos y bonificaciones · revisar si aplica", expanded=False):
+                for product_row, editor_line_ids in relevant_cost_rows:
+                    has_exception = any(
+                        queue_item["exceptions_by_line"].get(line_id) is not None
+                        and _requires_human_decision(queue_item["exceptions_by_line"][line_id])
+                        for line_id in editor_line_ids
+                    )
+                    if has_exception:
+                        st.warning(
+                            f"Excepción en {product_row.get('description') or 'líneas ' + ', '.join(editor_line_ids)}."
+                        )
+                    for line_id in editor_line_ids:
+                        line = line_by_id.get(line_id)
+                        if line is None:
+                            continue
+                        _render_cost_editor(
+                            source,
+                            invoice,
+                            line,
+                            invoice_reviews,
+                            review_state,
+                            line_by_id,
+                            product_row_by_line,
+                            reviewer_name,
+                        )
+
+        automatic_match_rows = _automatic_match_table_rows(queue_item)
+        if automatic_match_rows:
+            st.markdown('<div class="section-title">Coincidencias automáticas sin GTIN en XML</div>', unsafe_allow_html=True)
+            st.dataframe(automatic_match_rows, use_container_width=True, hide_index=True)
+            if any(not match.get("barcode") for match in queue_item["automatic_matches"]):
+                st.caption("Algunos libros existentes no guardaban el GTIN candidato; Sincronizar lo completa cuando Azure está disponible.")
+        draft_data = _draft_workbook_data(queue_item, invoice_reviews)
+        if draft_data is not None and not invoice_ready:
+            st.download_button(
+                f"Descargar borrador · Factura {invoice.invoice_id}",
+                data=draft_data,
+                file_name=f"{_safe_stem(source, invoice.invoice_id)}_borrador.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"draft_download_lote_{source.name}",
+                help="Disponible aunque falte GTIN; las coincidencias seguras quedan asignadas.",
+            )
+
+        if st.button("Continuar a revisión producto por producto", type="primary"):
+            st.session_state[step_key] = "producto"
+            st.rerun()
+        return
+
+    if not human_review_indexes:
+        st.success("No quedan excepciones pendientes de decisión humana.")
+        if st.button("Volver al lote", key=f"back_to_lote_{source.name}"):
+            st.session_state[step_key] = "lote"
+            st.rerun()
+        return
+    if current_index not in human_review_indexes:
+        current_index = human_review_indexes[0]
+        st.session_state[cursor_key] = current_index
+
     if not exceptions:
         st.success("Esta factura no tiene excepciones para revisar.")
         item = None
@@ -1524,6 +2094,9 @@ def main() -> None:
             ):
                 st.session_state[cursor_key] = next_indexes[0]
                 st.rerun()
+        if st.button("Volver al lote", key=f"back_to_lote_{source.name}"):
+            st.session_state[step_key] = "lote"
+            st.rerun()
         if pending_count == 0 and not _invoice_approval_is_current(source, invoice_reviews):
             next_invoice = _next_pending_invoice_index(queue, review_state, selected_index + 1)
             if next_invoice is None:
@@ -1604,7 +2177,7 @@ def main() -> None:
             "Consultar código exacto en EFFI" if line and line.barcode
             else "Corregir artículo manualmente" if not manual_review_required
             else "Editar manualmente · buscar en EFFI",
-            expanded=manual_review_required and (candidate is None or float(confidence or 0) < 0.72),
+            expanded=False,
         ):
             search_form = st.form(f"search_form_{review_key}")
             with search_form:
@@ -1707,6 +2280,110 @@ def main() -> None:
         DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
     )
     reviewed_path = base_output.with_name(base_output.stem.removesuffix("_effi") + "_revisado.xlsx")
+
+    review_preview_rows = []
+    automatic_match_by_line = {
+        match["line_id"]: match for match in queue_item.get("automatic_matches", [])
+    }
+    for product_row in product_rows:
+        line_ids = product_row["line_ids"]
+        decision = {"Línea": line_ids[0] if line_ids else "-", "Estado": "Pendiente", "Artículo": "", "Nombre": ""}
+        for line_id in line_ids:
+            review_info = invoice_reviews.get(line_id, {})
+            if review_info.get("status") in {"confirmed", "no_match"}:
+                decision = {
+                    "Línea": line_id,
+                    "Estado": "Confirmado" if review_info.get("status") == "confirmed" else "Sin coincidencia",
+                    "Artículo": review_info.get("product_id") or "",
+                    "Nombre": review_info.get("product_name") or "",
+                }
+                break
+        if decision["Estado"] == "Pendiente":
+            automatic_match = next(
+                (automatic_match_by_line[line_id] for line_id in line_ids if line_id in automatic_match_by_line),
+                None,
+            )
+            if automatic_match:
+                decision = {
+                    "Línea": automatic_match["line_id"],
+                    "Estado": "Coincidencia automática",
+                    "Artículo": automatic_match["product_id"],
+                    "Nombre": automatic_match["product_name"],
+                }
+        if decision["Estado"] == "Pendiente" and any(
+            invoice_reviews.get(line_id, {}).get("final_unit_cost") is not None or invoice_reviews.get(line_id, {}).get("is_bonus")
+            for line_id in line_ids
+        ):
+            decision = {
+                "Línea": line_ids[0] if line_ids else "-",
+                "Estado": "Costo / bonificación",
+                "Artículo": "",
+                "Nombre": "",
+            }
+        review_preview_rows.append({
+            "Factura": str(invoice.invoice_id),
+            "Línea": ", ".join(line_ids),
+            "Producto": str(product_row.get("description") or ""),
+            "Código": str(product_row.get("barcode") or ""),
+            "GTIN EFFI": str(next((
+                automatic_match_by_line[line_id].get("barcode") or ""
+                for line_id in line_ids if line_id in automatic_match_by_line
+            ), "")),
+            "Cantidad": str(product_row.get("quantity")),
+            "Neto": _money(product_row.get("net_total")),
+            "Costo unitario": _money(product_row.get("effective_cost")),
+            "Asignado": str(decision.get("Artículo") or product_row.get("article_id") or ""),
+            "Decisión": str(decision.get("Estado") or "Pendiente"),
+            "Bonificación": "Sí" if product_row.get("bonus") else "No",
+        })
+
+    st.markdown('<div class="section-title">Vista general del Excel</div>', unsafe_allow_html=True)
+    st.caption("Todos los productos del XML aparecen aquí. Las coincidencias seguras sin GTIN de factura se asignan por variante, familia y marca.")
+    st.dataframe(review_preview_rows, use_container_width=True, hide_index=True)
+
+    automatic_match_rows = []
+    for match in queue_item.get("automatic_matches", []):
+        product_text = f"{match.get('product_name') or ''} {match.get('reference') or ''}"
+        presentation = _presentation_tokens(product_text) or _variant_tokens(product_text)
+        automatic_match_rows.append({
+            "Línea": match["line_id"],
+            "Descripción factura": match.get("description") or "",
+            "IdProducto EFFI": match.get("product_id"),
+            "Producto EFFI": match.get("product_name") or "",
+            "Presentación / variante": ", ".join(sorted(presentation)) or "Sin dato",
+            "Referencia": match.get("reference") or "",
+            "Marca": match.get("brand") or "",
+            "Código de barras EFFI": match.get("barcode") or "Pendiente de actualizar catálogo",
+        })
+    if automatic_match_rows:
+        st.markdown('<div class="section-title">Coincidencias automáticas sin GTIN en XML</div>', unsafe_allow_html=True)
+        st.dataframe(automatic_match_rows, use_container_width=True, hide_index=True)
+        if any(not match.get("barcode") for match in queue_item["automatic_matches"]):
+            st.caption("Algunos libros existentes no guardaban el código EFFI candidato. Usa Sincronizar con Azure disponible para completar esos GTIN.")
+
+    draft_data = _draft_workbook_data(queue_item, invoice_reviews)
+    if draft_data is not None and not invoice_ready:
+        st.download_button(
+            f"Descargar borrador · Factura {invoice.invoice_id}",
+            data=draft_data,
+            file_name=base_output.stem.removesuffix("_effi") + "_borrador.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Disponible aunque falte un GTIN; las coincidencias automáticas seguras quedan asignadas y las demás líneas permanecen pendientes.",
+        )
+
+    if reviewed_path.is_file():
+        st.success(f"Ya existe el Excel generado: {reviewed_path.name}")
+        st.download_button(
+            "Descargar Excel revisado",
+            data=reviewed_path.read_bytes(),
+            file_name=reviewed_path.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    elif base_output.is_file():
+        st.info(f"Excel base generado: {base_output.name}. Falta aprobación para producir el archivo revisado.")
+    else:
+        st.info("Aún no existe ningún Excel para esta factura; se generará automáticamente cuando se procese la bandeja.")
+
     if approval_is_current and reviewed_path.is_file():
         st.success(
             f"Aprobada por {invoice_reviews[INVOICE_APPROVAL_KEY].get('approved_by', 'Sin nombre')} · "

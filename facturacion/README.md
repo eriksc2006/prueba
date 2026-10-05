@@ -17,7 +17,7 @@ El conversor toma XML UBL/DIAN de facturas de proveedores, incluidos los XML que
 - Lleva cantidad, precio unitario, descuento total de línea y código de impuesto configurado.
 - Para líneas promocionales con precio XML cero y descuento del 100%, reconstruye el precio bruto desde el descuento; corrige diferencias de redondeo de hasta $0,10 por línea para que el detalle importado reproduzca el neto XML.
 - Si una factura repite el mismo producto, consolida las unidades y calcula el costo efectivo como `neto total del grupo / unidades totales`. Esto distribuye el costo entre unidades pagadas y bonificadas sin cambiar el neto de factura. Requiere el mismo GTIN, `IdProducto`, referencia interna o descripción exacta (cuando no hay código), y la misma unidad; solo consolida si las líneas con importe comparten el perfil de impuesto. Perfiles fiscales incompatibles se mantienen separados.
-- Deja vacíos tipo de egreso, lote, serie y observación porque no se pueden inferir de forma fiable del detalle UBL de los ejemplos.
+- Asigna `1` al tipo de egreso cuando la línea no tiene código de barras; si tiene código de barras, deja esa casilla vacía. Lote, serie y observación quedan vacíos.
 - La tasa del 19% se asocia inicialmente al código EFFI `1`, mostrado en una fila de ejemplo de la plantilla. Verifica ese código en la empresa de EFFI antes de importar. Las demás tasas quedan sin código hasta configurarlas.
 - No inicia sesión ni crea facturas en Effi; genera archivos para revisión e importación manual.
 
@@ -87,7 +87,7 @@ El menú lateral organiza **Facturas**, **Revisión de productos**, **Excepcione
 
 3. Abre la URL local que muestra Streamlit y corrige únicamente las líneas que aparecen como pendientes: GTIN sin match único, candidatos de baja confianza, cantidades inválidas o diferencias de neto. Los GTIN únicos y grupos compatibles del mismo producto se asignan automáticamente; las bonificaciones al 100% se detectan y su costo se prorratea como `neto pagado / unidades pagadas y bonificadas`. Si un vínculo o impuesto no es seguro, queda para decisión humana.
 
-4. Cuando no queden excepciones pendientes, escribe el nombre de quien aprueba y usa **Generar Excel revisado**. Solo entonces se habilita la descarga del archivo `*_revisado.xlsx`. La aprobación registra responsable, fecha y una huella del XML y de las decisiones; si cambias una decisión o el XML, tendrás que aprobar de nuevo. Los costos, enlaces y aprobaciones quedan en `facturacion/output/revisiones_manuales.json`. Los archivos `*_effi.xlsx` generados antes de la aprobación son borradores: no los importes en EFFI.
+4. Cuando no queden excepciones pendientes, se habilita **Descargar Excel completo** para esa factura, incluso antes de la aprobación formal. Si además escribes el nombre del aprobador y usas **Registrar aprobación**, se guarda el archivo `*_revisado.xlsx` junto con responsable, fecha y una huella del XML y de las decisiones; si cambias una decisión o el XML, tendrás que aprobar de nuevo. Los costos, enlaces y aprobaciones quedan en `facturacion/output/revisiones_manuales.json`. Los archivos `*_effi.xlsx` generados antes de la revisión son borradores: no los importes en EFFI.
 
 En **Excepciones GTIN** aparecen los códigos no registrados junto con la factura y la descripción del XML. No se resuelven automáticamente por descripción: se deben vincular al producto correcto en EFFI. Para habilitar descarga automática de facturas se necesita integrar la API oficial de EFFI y configurar su autenticación; este proyecto no contiene actualmente ese conector.
 
@@ -114,6 +114,22 @@ python -m facturacion.azure_codes --code 7701234567890
 ```
 
 La conexión requiere que el firewall del servidor Azure SQL permita la IP de origen.
+
+## Pruebas
+## Descripciones recomendadas para el catálogo
+
+Para mejorar la coincidencia automática cuando el XML no trae GTIN, conserva los datos en campos separados siempre que EFFI lo permita. Usa este orden para el nombre visible:
+
+`MARCA · FAMILIA/LÍNEA · TIPO DE PRODUCTO · REFERENCIA O VARIANTE · PRESENTACIÓN`
+
+- **Marca:** nombre comercial estable; no alternes abreviatura y nombre completo.
+- **Familia/línea:** por ejemplo, `NOUVELLE`; conserva alias como `TNT` en un campo de sinónimos, no como reemplazo del nombre completo.
+- **Tipo de producto:** `TINTE`, `SHAMPOO`, `OXIDANTE`, `MÁSCARA`, etc.
+- **Referencia o variante:** conserva exactamente códigos como `12.013`, `10.1` o `N1 1-0`, incluidos puntos, guiones y ceros.
+- **Presentación:** cantidad y unidad normalizadas, por ejemplo `60 ML`, `250 ML` o `24 UND`; no mezcles `ML`, `MILILITROS` y `CC` para la misma unidad.
+- **Código de barras:** mantenlo en `CodigoBarras`, nunca dentro de la descripción.
+
+Evita nombres genéricos, códigos concatenados sin separadores y abreviaturas sin un alias registrado. La asignación automática sin GTIN exige una variante exacta, una familia coincidente, marca compatible con el proveedor y suficiente diferencia frente al siguiente candidato; si faltan esos datos, la línea queda para revisión.
 
 ## Pruebas
 

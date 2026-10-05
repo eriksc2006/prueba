@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import nullcontext
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -22,6 +23,61 @@ TEMPLATE = ROOT / "facturacion" / "files" / "template" / "plantilla_importacion_
 
 
 class InvoiceParsingTests(unittest.TestCase):
+    def test_confident_no_barcode_match_uses_variant_brand_and_margin(self) -> None:
+        from facturacion.generar_importacion import _confident_no_barcode_match
+        from facturacion.revisar_excepciones import _build_invoice_queue
+        from facturacion.revisar_excepciones import _requires_human_decision
+
+        queue = _build_invoice_queue()
+        invoice = next(item["invoice"] for item in queue if item["invoice"].invoice_id == "FECG315045")
+        line = next(line for line in invoice.lines if "12.013" in line.description)
+        candidate = {
+            "IdProducto": 5546,
+            "Nombre": "TNT. NOUVELLE #12.013",
+            "Referencia": "005563",
+            "Marca": "EURO STYLE",
+        }
+
+        self.assertTrue(_confident_no_barcode_match(line, candidate, 0.11, invoice.supplier_name))
+        self.assertFalse(_confident_no_barcode_match(
+            line, {**candidate, "Nombre": "TNT. NOUVELLE #10.013"}, 0.11, invoice.supplier_name
+        ))
+        self.assertFalse(_confident_no_barcode_match(line, candidate, 0.05, invoice.supplier_name))
+        self.assertFalse(_requires_human_decision({
+            "_automatic_match": True,
+            "Tipo": "Candidato cercano; validar identidad",
+        }))
+        self.assertTrue(_requires_human_decision({
+            "_automatic_match": True,
+            "Tipo": "Candidato cercano; validar identidad; Bonificación 100% detectada",
+        }))
+
+    def test_f2_tax_calculation_matches_effis_example(self) -> None:
+        from facturacion.revisar_excepciones import _price_including_taxes
+
+        self.assertEqual(
+            _price_including_taxes(Decimal("4705.88"), (Decimal("19"),)),
+            Decimal("5600.00"),
+        )
+
+    def test_cost_editor_only_targets_human_exceptions_and_saved_costs(self) -> None:
+        from facturacion.revisar_excepciones import _product_cost_editor_line_ids
+
+        product_row = {"line_ids": ["1", "2", "3", "4", "5"]}
+        exceptions_by_line = {
+            "1": {"Tipo": "Código de barras no registrado en EFFI"},
+            "2": {"Tipo": "Bonificación/prorrateo: costo efectivo calculado"},
+        }
+        invoice_reviews = {
+            "3": {"is_bonus": True},
+            "4": {"final_unit_cost": "1200.00"},
+        }
+
+        self.assertEqual(
+            _product_cost_editor_line_ids(product_row, exceptions_by_line, invoice_reviews),
+            ["1", "3", "4"],
+        )
+
     def test_parses_attached_document_and_embedded_invoice(self) -> None:
         invoice = parse_invoice(XML_DIR / "ad0811042361016260008d748.xml")
         self.assertEqual(invoice.invoice_id, "FI579400")
@@ -142,32 +198,131 @@ class InvoiceParsingTests(unittest.TestCase):
             with self.assertRaises(InvoiceParseError):
                 parse_invoice(path)
 
-    def test_main_does_not_auto_sync_on_first_load(self) -> None:
+    def test_unresolved_no_barcode_does_not_fallback_to_item_code(self) -> None:
+        from facturacion.generar_importacion import _resolved_product
+
+        line = Mock()
+        line.barcode = ""
+        line.description = "Producto sin coincidencia segura"
+        line.item_code = "ABC-999"
+
+        resolved_id, candidate, score, margin, accepted = _resolved_product(
+            line,
+            None,
+            {},
+            supplier_name="EURO STYLE",
+        )
+
+        self.assertIsNone(resolved_id)
+        self.assertFalse(accepted)
+        self.assertEqual(candidate, None)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(margin, 0.0)
+
+    def test_main_auto_syncs_on_first_load(self) -> None:
         from facturacion import revisar_excepciones
 
         fake_streamlit = Mock()
         fake_streamlit.session_state = {}
         fake_streamlit.sidebar = Mock()
         fake_streamlit.columns = Mock(return_value=[Mock(), Mock()])
+        fake_streamlit.empty = Mock()
+        fake_streamlit.container = Mock(return_value=Mock())
+        fake_streamlit.dataframe = Mock()
+        fake_streamlit.success = Mock()
+        fake_streamlit.warning = Mock()
+        fake_streamlit.info = Mock()
+        fake_streamlit.caption = Mock()
+        fake_streamlit.markdown = Mock()
+        fake_streamlit.button = Mock(return_value=False)
+
+        fake_streamlit.spinner = Mock(return_value=nullcontext())
 
         with (
             patch.object(revisar_excepciones, "st", fake_streamlit),
             patch.object(revisar_excepciones, "_render_styles"),
             patch.object(revisar_excepciones, "_invoice_queue", return_value=[]),
-            patch.object(revisar_excepciones, "_sync_invoice_workbooks") as sync_mock,
+            patch.object(revisar_excepciones, "_sync_invoice_workbooks", return_value={"generated": [], "mapped_barcodes": 0, "unmapped_barcodes": 0}) as sync_mock,
         ):
             revisar_excepciones.main()
 
-        sync_mock.assert_not_called()
+        sync_mock.assert_called_once_with(force=True)
 
 
 class WorkbookGenerationTests(unittest.TestCase):
+    def test_completed_workbook_download_builds_missing_base_workbook(self) -> None:
+        from io import BytesIO
+
+        from facturacion.revisar_excepciones import _build_invoice_queue, _draft_workbook_data
+
+        queue_item = next(item for item in _build_invoice_queue() if item["invoice"].invoice_id == "MAXI610")
+        queue_item["output"] = None
+
+        completed_data = _draft_workbook_data(queue_item, {})
+
+        self.assertIsNotNone(completed_data)
+        workbook = load_workbook(BytesIO(completed_data), data_only=True)
+        self.assertIn("Hoja1", workbook.sheetnames)
+        self.assertIn("Excepciones", workbook.sheetnames)
+        workbook.close()
+
+    def test_draft_download_applies_safe_match_without_approval(self) -> None:
+        from io import BytesIO
+
+        from facturacion.revisar_excepciones import _build_invoice_queue, _draft_workbook_data
+
+        queue = _build_invoice_queue()
+        item = next(item for item in queue if item["invoice"].invoice_id == "FECG315045")
+        draft_data = _draft_workbook_data(item, {})
+
+        self.assertIsNotNone(draft_data)
+        workbook = load_workbook(BytesIO(draft_data), data_only=True)
+        self.assertNotIn("Coincidencias automáticas", workbook.sheetnames)
+
+        detail = workbook["Hoja1"]
+        self.assertIsNone(detail.cell(row=2, column=1).value)
+        workbook.close()
+
+    def test_draft_download_uses_only_current_invoice_and_unsaved_bonus_link(self) -> None:
+        from io import BytesIO
+
+        from facturacion import revisar_excepciones
+
+        queue_item = next(
+            item for item in revisar_excepciones._build_invoice_queue()
+            if item["invoice"].invoice_id == "FECG315045"
+        )
+        paid_line = next(line for line in queue_item["invoice"].lines if line.item_code == "NOUSHAPROT" and line.net_amount > 0)
+        bonus_line = next(line for line in queue_item["invoice"].lines if line.item_code == "NOUSHAPROT" and line.net_amount == 0)
+        session_state = {
+            f"is_bonus_{queue_item['source'].name}_{bonus_line.line_id}": True,
+            f"bonus_link_{queue_item['source'].name}_{bonus_line.line_id}": paid_line.line_id,
+        }
+
+        with patch.object(revisar_excepciones.st, "session_state", session_state):
+            draft_data = revisar_excepciones._draft_workbook_data(queue_item, {})
+
+        workbook = load_workbook(BytesIO(draft_data), data_only=True)
+        detail = workbook["Hoja1"]
+        import_row = queue_item["import_row_by_line"][str(paid_line.line_id)]
+        self.assertEqual(detail.cell(import_row, 6).value, paid_line.quantity + bonus_line.quantity)
+        self.assertEqual(
+            Decimal(str(detail.cell(import_row, 7).value)),
+            (paid_line.net_amount + bonus_line.net_amount) / (paid_line.quantity + bonus_line.quantity),
+        )
+        populated_rows = [
+            row for row in range(2, detail.max_row + 1)
+            if detail.cell(row, 6).value is not None
+        ]
+        self.assertEqual(len(populated_rows), queue_item["product_count"])
+        workbook.close()
+
     def test_reviewer_queue_lists_all_invoices_and_consolidated_products(self) -> None:
         from facturacion.revisar_excepciones import _invoice_product_rows, _invoice_queue
 
         queue = _invoice_queue()
-        self.assertEqual(len(queue), 7)
-        self.assertEqual(sum(len(item["invoice"].lines) for item in queue), 142)
+        self.assertEqual(len(queue), 8)
+        self.assertEqual(sum(len(item["invoice"].lines) for item in queue), 170)
         self.assertTrue(all(item["product_count"] > 0 for item in queue))
         invoice = next(item for item in queue if item["invoice"].invoice_id == "3166244")
         products = _invoice_product_rows(invoice, {})
@@ -175,6 +330,36 @@ class WorkbookGenerationTests(unittest.TestCase):
         bonus = next(product for product in products if product["barcode"] == "7702113048636")
         self.assertEqual(bonus["line_ids"], ["2", "3"])
         self.assertEqual(bonus["quantity"], Decimal("27.00"))
+
+    def test_sync_generates_missing_invoice_offline_as_pending_review(self) -> None:
+        from facturacion import revisar_excepciones
+
+        source = XML_DIR / "ad080021284002726837920260926084002509.xml"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            xml_dir = root / "xml"
+            output_dir = root / "output"
+            xml_dir.mkdir()
+            output_dir.mkdir()
+            (xml_dir / source.name).write_bytes(source.read_bytes())
+            with (
+                patch.object(revisar_excepciones, "DEFAULT_XML_DIR", xml_dir),
+                patch.object(revisar_excepciones, "DEFAULT_OUTPUT_DIR", output_dir),
+                patch.object(revisar_excepciones, "REVIEW_FILE", output_dir / "reviews.json"),
+                patch.object(
+                    revisar_excepciones,
+                    "_cached_barcode_product_ids",
+                    side_effect=RuntimeError("Azure firewall blocked the connection"),
+                ),
+            ):
+                result = revisar_excepciones._sync_invoice_workbooks(force=True)
+                self.assertIn("Azure firewall", result["lookup_error"])
+                self.assertEqual(result["generated"], [source.name])
+                queue = revisar_excepciones._build_invoice_queue()
+
+            self.assertEqual(len(queue), 1)
+            self.assertFalse(revisar_excepciones._invoice_review_complete(queue[0], {}))
+            self.assertTrue(queue[0]["output"].is_file())
 
     def test_invoice_queue_reuses_cache_until_xml_or_workbook_changes(self) -> None:
         from facturacion import revisar_excepciones
@@ -372,7 +557,7 @@ class WorkbookGenerationTests(unittest.TestCase):
             }
             self.assertEqual(len(import_rows), 1)
             import_row = import_rows.pop()
-            self.assertEqual(detail.cell(import_row, 1).value, "NOUSHAPROT")
+            self.assertIsNone(detail.cell(import_row, 1).value)
             self.assertEqual(Decimal(str(detail.cell(import_row, 6).value)), total_quantity)
             self.assertEqual(Decimal(str(detail.cell(import_row, 7).value)), Decimal("13125"))
             self.assertEqual(Decimal(str(detail.cell(import_row, 8).value)), Decimal("0"))
@@ -383,7 +568,7 @@ class WorkbookGenerationTests(unittest.TestCase):
             workbook.close()
 
     def test_reviewed_workbook_prorates_explicit_bonus_link_without_override(self) -> None:
-        from facturacion.revisar_excepciones import _reviewed_workbook
+        from facturacion.revisar_excepciones import _line_product_key, _reviewed_workbook
 
         source = XML_DIR / "ad089030295502726356720260928112521401.xml"
         invoice = parse_invoice(source)
@@ -438,6 +623,24 @@ class WorkbookGenerationTests(unittest.TestCase):
             )
             self.assertEqual(Decimal(str(detail.cell(import_row, 8).value)), Decimal("0"))
             workbook.close()
+
+            incompatible_paid_line = next(
+                line for line in invoice.lines
+                if line.net_amount > 0 and _line_product_key(line) != _line_product_key(bonus_line)
+            )
+            with self.assertRaisesRegex(ValueError, "producto incompatible"):
+                _reviewed_workbook(
+                    {"invoice": invoice, "source": source, "output": output},
+                    {
+                        incompatible_paid_line.line_id: {"status": "confirmed", "product_id": 65432},
+                        bonus_line.line_id: {
+                            "status": "confirmed",
+                            "product_id": 98765,
+                            "is_bonus": True,
+                            "bonus_link_line": incompatible_paid_line.line_id,
+                        },
+                    },
+                )
 
     def test_final_imported_net_matches_all_sample_invoice_totals(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -643,12 +846,12 @@ class WorkbookGenerationTests(unittest.TestCase):
             workbook = load_workbook(output, data_only=False)
             sheet = workbook.active
             self.assertEqual(sheet.cell(1, 1).value, "Artículo (ID EFFI | Código de barras GTIN | Serie)")
-            self.assertEqual(sheet.cell(2, 1).value, "MJPT-235")
+            self.assertIsNone(sheet.cell(2, 1).value)
             self.assertEqual(sheet.cell(2, 6).value, 2)
             self.assertEqual(sheet.cell(2, 7).value, 29148.74)
             self.assertEqual(sheet.cell(2, 8).value, 11659.5)
             self.assertEqual(sheet.cell(2, 9).value, 1)
-            self.assertIsNone(sheet.cell(2, 2).value)
+            self.assertEqual(sheet.cell(2, 2).value, 1)
             self.assertEqual(
                 round(sheet.cell(2, 7).value * sheet.cell(2, 6).value - sheet.cell(2, 8).value, 2),
                 round(float(invoice.lines[0].net_amount), 2),
@@ -672,6 +875,7 @@ class WorkbookGenerationTests(unittest.TestCase):
             )
             workbook = load_workbook(output, data_only=False)
             self.assertEqual(workbook.active.cell(2, 1).value, 98765)
+            self.assertIsNone(workbook.active.cell(2, 2).value)
             workbook.close()
 
     def test_unregistered_barcode_does_not_fall_back_to_description(self) -> None:
@@ -750,6 +954,44 @@ class WorkbookGenerationTests(unittest.TestCase):
         }
         self.assertGreater(_candidate_score(line, matching), _candidate_score(line, wrong_product))
 
+    def test_auto_match_without_invoice_barcode_writes_catalog_barcode(self) -> None:
+        from facturacion.generar_importacion import _normalize_description
+
+        source = next(
+            path for path in XML_DIR.glob("*.xml")
+            if parse_invoice(path).invoice_id == "FECG315045"
+        )
+        invoice = parse_invoice(source)
+        line = next(line for line in invoice.lines if "12.013" in line.description)
+        candidate = {
+            "IdProducto": 5546,
+            "CodigoBarras": "7701234567890",
+            "Nombre": "TNT. NOUVELLE #12.013",
+            "Referencia": "005563",
+            "Marca": "EURO STYLE",
+            "Categoria": "TINTURAS",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "automatic_match.xlsx"
+            generate_workbook(
+                source,
+                TEMPLATE,
+                output,
+                DEFAULT_TAX_CODES,
+                product_ids_by_barcode={},
+                product_ids_by_description={_normalize_description(line.description): [candidate]},
+            )
+            workbook = load_workbook(output, data_only=True)
+            matches = workbook["Coincidencias automáticas"]
+            row = next(
+                row for row in matches.iter_rows(min_row=2, values_only=True)
+                if str(row[0]) == line.line_id
+            )
+            self.assertEqual(row[2], 5546)
+            self.assertEqual(row[4], "7701234567890")
+            self.assertIn(5546, [workbook.active.cell(index, 1).value for index in range(2, workbook.active.max_row + 1)])
+            workbook.close()
+
     def test_amount_discrepancy_and_closest_candidate_are_written_to_exceptions(self) -> None:
         from facturacion.generar_importacion import _normalize_description
 
@@ -797,8 +1039,8 @@ class WorkbookGenerationTests(unittest.TestCase):
 
     def test_all_sample_xml_files_have_invoice_lines(self) -> None:
         invoices = [parse_invoice(path) for path in XML_DIR.glob("*.xml")]
-        self.assertEqual(len(invoices), 7)
-        self.assertEqual(sum(len(invoice.lines) for invoice in invoices), 142)
+        self.assertEqual(len(invoices), 8)
+        self.assertEqual(sum(len(invoice.lines) for invoice in invoices), 170)
 
 
 if __name__ == "__main__":
