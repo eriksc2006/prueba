@@ -1,3 +1,13 @@
+"""Acceso a Azure SQL para consultar el catálogo de productos EFFI.
+
+Este módulo centraliza la conexión con el repositorio de productos en Azure SQL,
+realiza búsquedas por código de barras y texto libre, y expone utilidades para
+que la lógica de importación y revisión de excepciones pueda validar productos
+sin depender de EFFI directamente. La configuración se toma desde
+facturacion/.env con variables como SQL_SERVER, SQL_DATABASE, SQL_USERNAME y
+SQL_DRIVER.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,6 +25,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 
 
 def _connection_string() -> str:
+    """Construye la cadena de conexión ODBC usando la configuración local del entorno."""
     server = os.getenv("SQL_SERVER", "").strip()
     database = os.getenv("SQL_DATABASE", "").strip()
     if not server or not database:

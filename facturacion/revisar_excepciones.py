@@ -1,3 +1,12 @@
+"""Interfaz de revisión humana para facturas con excepciones de importación.
+
+La aplicación Streamlit permite inspeccionar facturas, validar coincidencias de
+productos y decidir manualmente qué líneas requieren corrección antes de
+importarlas a EFFI. El flujo está pensado para operar con los XML locales y el
+catálogo de Azure sin descargar facturas desde EFFI, dejando un historial de
+decisiones y aprobaciones en facturacion/output/revisiones_manuales.json.
+"""
+
 from __future__ import annotations
 
 import html
@@ -255,6 +264,13 @@ def _invoice_review_complete(queue_item: dict[str, Any], invoice_reviews: dict[s
 
 
 def _requires_human_decision(exception: dict[str, Any]) -> bool:
+    """Indica si una excepción requiere intervención manual del usuario.
+
+    Esta lógica sirve para distinguir entre errores que se pueden resolver
+    automáticamente, ejercicios de bonificación con costo prorrateado y casos en
+    los que el sistema no tiene evidencia suficiente para elegir un producto o un
+    costo sin riesgo.
+    """
     reason = str(exception.get("Tipo") or "")
     if exception.get("_automatic_match"):
         reason = re.sub(r"Sin coincidencia confiable|Candidato cercano; validar identidad", "", reason)

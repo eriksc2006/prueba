@@ -1,4 +1,21 @@
-"""Parse DIAN UBL invoices and create EFFI purchase-detail import workbooks."""
+"""Generación de libros de importación EFFI desde XML UBL/DIAN.
+
+Este módulo procesa facturas de proveedores en formato DIAN/UBL, normaliza el
+detalle de líneas y crea el libro Excel usado como plantilla de importación en
+EFFI. La implementación cubre los casos más comunes del negocio colombiano:
+
+- extracción de Invoice o AttachedDocument
+- reconocimiento de códigos de barra, item del comprador y código de proveedor
+- reconstrucción de precio/descuento/neto cuando el XML trae bonificaciones o
+  ajustes de redondeo
+- consolidación de líneas repetidas por producto para preservar el neto total
+  y calcular costo efectivo
+- mapeo de tasas tributarias a códigos EFFI configurables
+- generación del Excel con advertencias y excepciones para revisión humana
+
+La intención es mantener el XML como fuente de verdad para el valor neto y, al
+mismo tiempo, producir un archivo listo para revisión/importación manual en EFFI.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +54,14 @@ class InvoiceParseError(ValueError):
 
 @dataclass(frozen=True)
 class InvoiceLine:
+    """Representa una línea de factura DIAN con su información financiera y fiscal.
+
+    Se usa como estructura central para el cálculo del neto, el desglosamiento de
+    descuentos, la identificación del producto y la generación del Excel de
+    importación. Los valores se mantienen en Decimals para evitar errores de
+    redondeo en montos de dinero.
+    """
+
     line_id: str
     item_code: str
     barcode: str
@@ -51,6 +76,8 @@ class InvoiceLine:
 
 @dataclass(frozen=True)
 class Invoice:
+    """Cabecera de factura con todas sus líneas de detalle."""
+
     invoice_id: str
     issue_date: str
     supplier_name: str
@@ -485,6 +512,14 @@ def _group_import_lines(
     product_ids_by_barcode: Mapping[str, Any] | None,
     product_ids_by_description: Mapping[str, Any] | None,
 ) -> list[tuple[InvoiceLine, ...]]:
+    """Agrupa líneas por producto para exportar un único registro a EFFI.
+
+    La agrupación evita duplicar artículos cuando una misma referencia aparece en
+    varias líneas de factura. Cuando el sistema puede verificar que todas las
+    líneas pertenecen al mismo producto y comparten el perfil fiscal, se calcula
+    un costo efectivo combinado; en caso contrario se conservan separadas para no
+    distorsionar el neto de la factura.
+    """
     grouped: dict[tuple[str, str, str], list[InvoiceLine]] = {}
     for line in invoice.lines:
         if line.barcode:
@@ -586,6 +621,14 @@ def _write_detail(
     product_ids_by_barcode: Mapping[str, Any] | None = None,
     product_ids_by_description: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, int], list[tuple[InvoiceLine, ...]]]:
+    """Escribe el detalle de la factura sobre la hoja de importación EFFI.
+
+    La plantilla del libro se reutiliza para conservar formato y columnas, pero
+    se limpia el contenido de filas de ejemplo para poblar únicamente las líneas
+    reales de la factura. Cada fila representa un producto o un grupo de líneas
+    compatibles, y se persiste el precio, descuento y código tributario que
+    reproduzcan el neto XML sin alterar la factura original.
+    """
     # The supplied workbook has sample lines in rows 2-4. Remove cell values
     # only; preserve the template's formatting and its header row.
     for row in sheet.iter_rows(min_row=2, max_row=max(sheet.max_row, len(invoice.lines) + 1), min_col=1, max_col=9):
