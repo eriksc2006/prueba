@@ -60,6 +60,35 @@ class InvoiceParsingTests(unittest.TestCase):
             Decimal("5600.00"),
         )
 
+    def test_connection_string_includes_credentials_for_active_directory_password(self) -> None:
+        from facturacion.azure_codes import _connection_string
+
+        with patch.dict("os.environ", {
+            "SQL_SERVER": "server.example",
+            "SQL_DATABASE": "database",
+            "SQL_USERNAME": "user@example.com",
+            "SQL_PASSWORD": "secret",
+            "SQL_AUTHENTICATION": "ActiveDirectoryPassword",
+        }, clear=False):
+            connection_string = _connection_string()
+
+        self.assertIn("Authentication=ActiveDirectoryPassword;", connection_string)
+        self.assertIn("UID=user@example.com;", connection_string)
+        self.assertIn("PWD=secret;", connection_string)
+
+    def test_connection_string_requires_credentials_for_active_directory_password(self) -> None:
+        from facturacion.azure_codes import _connection_string
+
+        with patch.dict("os.environ", {
+            "SQL_SERVER": "server.example",
+            "SQL_DATABASE": "database",
+            "SQL_USERNAME": "",
+            "SQL_PASSWORD": "",
+            "SQL_AUTHENTICATION": "ActiveDirectoryPassword",
+        }, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "SQL_USERNAME.*SQL_PASSWORD"):
+                _connection_string()
+
     def test_cost_editor_only_targets_human_exceptions_and_saved_costs(self) -> None:
         from facturacion.revisar_excepciones import _product_cost_editor_line_ids
 
@@ -417,6 +446,32 @@ class WorkbookGenerationTests(unittest.TestCase):
             for line in invoice.lines:
                 if line.barcode:
                     self.assertEqual(queued_invoice["article_ids"][str(line.line_id)], 98765)
+
+    def test_invoice_sync_passes_description_product_ids_to_workbook_generation(self) -> None:
+        from facturacion.revisar_excepciones import _sync_invoice_workbooks
+
+        source = XML_DIR / "ad080021284002726837920260926084002509.xml"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            xml_dir = root / "xml"
+            output_dir = root / "output"
+            xml_dir.mkdir()
+            output_dir.mkdir()
+            (xml_dir / source.name).write_bytes(source.read_bytes())
+            description_ids = {"linea sin gtin": 54321}
+            with (
+                patch("facturacion.revisar_excepciones.DEFAULT_XML_DIR", xml_dir),
+                patch("facturacion.revisar_excepciones.DEFAULT_OUTPUT_DIR", output_dir),
+                patch("facturacion.revisar_excepciones.REVIEW_FILE", output_dir / "reviews.json"),
+                patch("facturacion.revisar_excepciones._cached_barcode_product_ids", return_value={}),
+                patch("facturacion.revisar_excepciones.get_product_ids_by_descriptions", return_value=description_ids) as lookup,
+                patch("facturacion.revisar_excepciones._existing_tax_codes", return_value={}),
+                patch("facturacion.revisar_excepciones.generate_workbook") as generate_workbook_mock,
+            ):
+                _sync_invoice_workbooks(force=True)
+
+            lookup.assert_called_once()
+            self.assertEqual(generate_workbook_mock.call_args.kwargs["product_ids_by_description"], description_ids)
 
     def test_prorates_bonus_units_for_repeated_barcode(self) -> None:
         source = XML_DIR / "ad089030295502726356720260928112521401.xml"

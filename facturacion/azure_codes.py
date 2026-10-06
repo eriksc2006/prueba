@@ -46,16 +46,24 @@ def _connection_string() -> str:
     ]
 
     authentication = os.getenv("SQL_AUTHENTICATION", "").strip()
+    username = os.getenv("SQL_USERNAME", "").strip()
+    password = os.getenv("SQL_PASSWORD", "")
+
     if authentication:
         parts.append(f"Authentication={authentication};")
+        if authentication == "ActiveDirectoryPassword":
+            if not username or not password:
+                raise RuntimeError(
+                    "Para SQL_AUTHENTICATION=ActiveDirectoryPassword, configura "
+                    "SQL_USERNAME y SQL_PASSWORD en facturacion/.env."
+                )
+            parts.extend((f"UID={username};", f"PWD={password};"))
+    elif not username or not password:
+        raise RuntimeError(
+            "Configura SQL_USERNAME y SQL_PASSWORD, o SQL_AUTHENTICATION, "
+            "en facturacion/.env."
+        )
     else:
-        username = os.getenv("SQL_USERNAME", "").strip()
-        password = os.getenv("SQL_PASSWORD", "")
-        if not username or not password:
-            raise RuntimeError(
-                "Configura SQL_USERNAME y SQL_PASSWORD, o SQL_AUTHENTICATION, "
-                "en facturacion/.env."
-            )
         parts.extend((f"UID={username};", f"PWD={password};"))
 
     return "".join(parts)

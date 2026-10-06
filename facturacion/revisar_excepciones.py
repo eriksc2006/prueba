@@ -33,7 +33,11 @@ REPOSITORY_ROOT = ROOT.parent
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from facturacion.azure_codes import search_products, search_products_by_barcode
+from facturacion.azure_codes import (
+    get_product_ids_by_descriptions,
+    search_products,
+    search_products_by_barcode,
+)
 from facturacion.generar_importacion import (
     DEFAULT_TAX_CODES,
     DEFAULT_OUTPUT_DIR,
@@ -219,7 +223,10 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
         barcode_codes = tuple(sorted({
             line.barcode for invoice in invoices for line in invoice.lines if line.barcode
         }))
-    product_ids_by_description: dict[str, Any] = {}
+    description_keys = tuple(sorted({
+        line.description for invoice in invoices for line in invoice.lines if not line.barcode
+    }))
+    product_ids_by_description = get_product_ids_by_descriptions(description_keys)
     generated_sources = []
     for source, invoice, output in parsed_invoices:
         tax_codes = _existing_tax_codes(
