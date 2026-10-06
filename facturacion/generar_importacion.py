@@ -440,11 +440,16 @@ def _description_match(
         return None, 0.0, 0.0
     if not isinstance(value, (list, tuple)):
         if isinstance(value, Mapping):
-            return value, 1.0, 1.0
-        return {"IdProducto": value}, 1.0, 1.0
+            value = [value]
+        else:
+            return None, 0.0, 0.0
 
     ranked = sorted(
-        ((candidate, _candidate_score(line, candidate)) for candidate in value),
+        (
+            (candidate, _candidate_score(line, candidate))
+            for candidate in value
+            if isinstance(candidate, Mapping)
+        ),
         key=lambda item: item[1],
         reverse=True,
     )

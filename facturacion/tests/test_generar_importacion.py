@@ -220,6 +220,42 @@ class InvoiceParsingTests(unittest.TestCase):
         self.assertEqual(len(parameters), 8)
         self.assertEqual(candidates["savital proteinas"][0]["IdProducto"], 10)
 
+    def test_description_id_lookup_preserves_full_product_candidates(self) -> None:
+        from facturacion.azure_codes import get_product_ids_by_descriptions
+
+        product = {"IdProducto": 10, "Nombre": "SAVITAL PROTEINAS", "Marca": "SAVITAL"}
+        with patch(
+            "facturacion.azure_codes.get_product_candidates_by_descriptions",
+            return_value={"savital proteinas": [product]},
+        ) as lookup:
+            candidates = get_product_ids_by_descriptions(["SAVITAL PROTEINAS"])
+
+        lookup.assert_called_once_with(["SAVITAL PROTEINAS"])
+        self.assertEqual(candidates, {"savital proteinas": [product]})
+
+    def test_singular_description_lookup_rejects_ambiguous_results(self) -> None:
+        from facturacion.azure_codes import get_product_by_description
+
+        products = [{"IdProducto": 10}, {"IdProducto": 11}]
+        with patch(
+            "facturacion.azure_codes.get_product_candidates_by_descriptions",
+            return_value={"savital proteinas": products},
+        ):
+            product = get_product_by_description("SAVITAL PROTEINAS")
+
+        self.assertIsNone(product)
+
+    def test_singular_description_lookup_rejects_single_partial_candidate(self) -> None:
+        from facturacion.azure_codes import get_product_by_description
+
+        with patch(
+            "facturacion.azure_codes.get_product_candidates_by_descriptions",
+            return_value={"savital proteinas": [{"IdProducto": 10, "Nombre": "SAVITAL"}]},
+        ):
+            product = get_product_by_description("SAVITAL PROTEINAS")
+
+        self.assertIsNone(product)
+
     def test_rejects_xml_without_invoice(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "bad.xml"
@@ -247,6 +283,26 @@ class InvoiceParsingTests(unittest.TestCase):
         self.assertEqual(candidate, None)
         self.assertEqual(score, 0.0)
         self.assertEqual(margin, 0.0)
+
+    def test_description_id_without_candidate_data_is_not_auto_matched(self) -> None:
+        from facturacion.generar_importacion import _resolved_product, _normalize_description
+
+        line = Mock()
+        line.barcode = ""
+        line.description = "Producto parcial"
+        line.item_code = ""
+
+        resolved_id, candidate, score, margin, accepted = _resolved_product(
+            line,
+            None,
+            {_normalize_description(line.description): 5001},
+        )
+
+        self.assertIsNone(resolved_id)
+        self.assertIsNone(candidate)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(margin, 0.0)
+        self.assertFalse(accepted)
 
     def test_main_auto_syncs_on_first_load(self) -> None:
         from facturacion import revisar_excepciones
@@ -432,8 +488,8 @@ class WorkbookGenerationTests(unittest.TestCase):
                 patch("facturacion.revisar_excepciones.REVIEW_FILE", output_dir / "reviews.json"),
                 patch("facturacion.azure_codes.get_product_ids_by_barcodes", return_value=barcode_ids),
                 patch(
-                    "facturacion.azure_codes.get_product_candidates_by_descriptions",
-                    side_effect=AssertionError("dashboard GTIN sync must not scan descriptions"),
+                    "facturacion.revisar_excepciones.get_product_ids_by_descriptions",
+                    return_value={},
                 ),
             ):
                 _invoice_queue()
@@ -971,6 +1027,13 @@ class WorkbookGenerationTests(unittest.TestCase):
         invoice = parse_invoice(source)
         self.assertTrue(invoice.lines)
         self.assertTrue(all(not line.barcode for line in invoice.lines))
+        line = invoice.lines[0]
+        candidate = {
+            "IdProducto": 5001,
+            "Nombre": line.description,
+            "Referencia": "HK IGORA",
+            "Marca": "IGORA",
+        }
 
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "mapped_by_description.xlsx"
@@ -980,7 +1043,7 @@ class WorkbookGenerationTests(unittest.TestCase):
                 output,
                 DEFAULT_TAX_CODES,
                 product_ids_by_barcode={},
-                product_ids_by_description={"hk igora vit n1 1 0 negro px24": 5001},
+                product_ids_by_description={"hk igora vit n1 1 0 negro px24": [candidate]},
             )
             workbook = load_workbook(output, data_only=False)
             self.assertEqual(workbook.active.cell(2, 1).value, 5001)
@@ -1008,6 +1071,30 @@ class WorkbookGenerationTests(unittest.TestCase):
             "PrecioConImpuestoTarifaNormal": 30000,
         }
         self.assertGreater(_candidate_score(line, matching), _candidate_score(line, wrong_product))
+
+    def test_description_match_rejects_equal_scoring_candidates(self) -> None:
+        from facturacion.generar_importacion import _resolved_product
+
+        line = parse_invoice(XML_DIR / "ad09013821010002600127292.xml").lines[0]
+        candidate = {
+            "IdProducto": 5001,
+            "Nombre": line.description,
+            "Referencia": "HK IGORA",
+            "Marca": "IGORA",
+        }
+        duplicate = {**candidate, "IdProducto": 5002}
+
+        resolved_id, best, score, margin, accepted = _resolved_product(
+            line,
+            None,
+            {"hk igora vit n1 1 0 negro px24": [candidate, duplicate]},
+        )
+
+        self.assertIsNone(resolved_id)
+        self.assertEqual(best, candidate)
+        self.assertGreater(score, 0.72)
+        self.assertEqual(margin, 0.0)
+        self.assertFalse(accepted)
 
     def test_auto_match_without_invoice_barcode_writes_catalog_barcode(self) -> None:
         from facturacion.generar_importacion import _normalize_description

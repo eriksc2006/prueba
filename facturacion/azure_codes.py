@@ -328,22 +328,30 @@ def get_product_candidates_by_descriptions(
 
 
 def get_product_by_description(description: str) -> dict[str, Any] | None:
-    """Return an Azure product by matching normalized description text."""
+    """Return a product only for one exact normalized name or reference match."""
     candidates = get_product_candidates_by_descriptions([description])
-    products = candidates.get(_normalize_description(description), [])
-    return products[0] if products else None
+    normalized = _normalize_description(description)
+    products = candidates.get(normalized, [])
+    exact_matches = [
+        product
+        for product in products
+        if any(
+            _normalize_description(str(product.get(field) or "")) == normalized
+            for field in ("Nombre", "Referencia")
+        )
+    ]
+    return exact_matches[0] if len(exact_matches) == 1 else None
 
 
-def get_product_ids_by_descriptions(descriptions: Iterable[str]) -> dict[str, Any]:
-    """Return IdProducto mapped by normalized description when barcode lookup fails."""
-    normalized: dict[str, Any] = {}
-    for description in dict.fromkeys(
-        (str(item).strip() for item in descriptions if item and str(item).strip())
-    ):
-        product = get_product_by_description(description)
-        if product and product.get("IdProducto") is not None:
-            normalized[_normalize_description(description)] = product["IdProducto"]
-    return normalized
+def get_product_ids_by_descriptions(
+    descriptions: Iterable[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return full product candidates indexed by normalized description."""
+    candidates = get_product_candidates_by_descriptions(descriptions)
+    return {
+        normalized: [product for product in products if product.get("IdProducto") is not None]
+        for normalized, products in candidates.items()
+    }
 
 
 def main() -> int:
