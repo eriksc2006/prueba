@@ -226,7 +226,13 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
     description_keys = tuple(sorted({
         line.description for invoice in invoices for line in invoice.lines if not line.barcode
     }))
-    product_ids_by_description = get_product_ids_by_descriptions(description_keys)
+    try:
+        product_ids_by_description = get_product_ids_by_descriptions(description_keys)
+    except Exception as error:
+        product_ids_by_description = {}
+        lookup_error = "; ".join(
+            message for message in (lookup_error, str(error)) if message
+        )
     generated_sources = []
     for source, invoice, output in parsed_invoices:
         tax_codes = _existing_tax_codes(

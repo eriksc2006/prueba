@@ -529,6 +529,37 @@ class WorkbookGenerationTests(unittest.TestCase):
             lookup.assert_called_once()
             self.assertEqual(generate_workbook_mock.call_args.kwargs["product_ids_by_description"], description_ids)
 
+    def test_sync_generates_invoice_offline_when_description_lookup_fails(self) -> None:
+        from facturacion.revisar_excepciones import _sync_invoice_workbooks
+
+        source = XML_DIR / "ad080021284002726837920260926084002509.xml"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            xml_dir = root / "xml"
+            output_dir = root / "output"
+            xml_dir.mkdir()
+            output_dir.mkdir()
+            (xml_dir / source.name).write_bytes(source.read_bytes())
+            with (
+                patch("facturacion.revisar_excepciones.DEFAULT_XML_DIR", xml_dir),
+                patch("facturacion.revisar_excepciones.DEFAULT_OUTPUT_DIR", output_dir),
+                patch("facturacion.revisar_excepciones.REVIEW_FILE", output_dir / "reviews.json"),
+                patch("facturacion.revisar_excepciones._cached_barcode_product_ids", return_value={}),
+                patch(
+                    "facturacion.revisar_excepciones.get_product_ids_by_descriptions",
+                    side_effect=RuntimeError("Azure firewall blocked the description lookup"),
+                ),
+                patch("facturacion.revisar_excepciones._existing_tax_codes", return_value={}),
+            ):
+                result = _sync_invoice_workbooks(force=True)
+
+            self.assertIn("description lookup", result["lookup_error"])
+            self.assertEqual(result["generated"], [source.name])
+            self.assertEqual(result["mapped_barcodes"], 0)
+            generated_files = list(output_dir.glob("*_effi.xlsx"))
+            self.assertEqual(len(generated_files), 1)
+            self.assertTrue(generated_files[0].is_file())
+
     def test_prorates_bonus_units_for_repeated_barcode(self) -> None:
         source = XML_DIR / "ad089030295502726356720260928112521401.xml"
         invoice = parse_invoice(source)
