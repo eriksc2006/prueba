@@ -50,7 +50,7 @@ from facturacion.generar_importacion import (
     _normalize_description,
     _presentation_tokens,
     _variant_tokens,
-    _safe_stem,
+    _invoice_output_stem,
     generate_workbook,
     parse_invoice,
 )
@@ -147,12 +147,9 @@ def _invalidate_reviewed_workbook(path: Path) -> Path | None:
 
 
 def _invoice_output_path(source: Path, invoice: Any) -> Path:
-    invoice_id = _safe_stem(source, invoice.invoice_id)
-    supplier_id = _safe_stem(source, getattr(invoice, "supplier_tax_id", "") or "")
-    if supplier_id and supplier_id != invoice_id:
-        base = f"{invoice_id}_{supplier_id}"
-    else:
-        base = invoice_id
+    base = _invoice_output_stem(
+        source, invoice.invoice_id, getattr(invoice, "supplier_tax_id", "") or ""
+    )
     return DEFAULT_OUTPUT_DIR / f"{base}_effi.xlsx"
 
 
@@ -467,7 +464,7 @@ def _build_invoice_queue() -> list[dict[str, Any]]:
             invoice = parse_invoice(source)
         except (OSError, ValueError):
             continue
-        output = DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
+        output = _invoice_output_path(source, invoice)
         exceptions = _read_exception_rows(output) if output.is_file() else []
         automatic_matches = _read_automatic_match_rows(output) if output.is_file() else []
         import_row_by_line = {
@@ -675,7 +672,13 @@ def _record_review(
     }
     invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
     _save_review_state(state)
-    output_path = DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice_id or source.stem)}_effi.xlsx"
+    try:
+        invoice = parse_invoice(source)
+        output_path = _invoice_output_path(source, invoice)
+    except (OSError, ValueError):
+        output_path = DEFAULT_OUTPUT_DIR / (
+            f"{_invoice_output_stem(source, invoice_id or source.stem)}_effi.xlsx"
+        )
     reviewed_path = output_path.with_name(output_path.stem.removesuffix("_effi") + "_revisado.xlsx")
     _invalidate_reviewed_workbook(reviewed_path)
 
@@ -702,7 +705,11 @@ def _record_cost_review(
         line_review["status"] = "cost_saved"
     invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
     _save_review_state(state)
-    output_path = DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, source.stem)}_effi.xlsx"
+    try:
+        invoice = parse_invoice(source)
+        output_path = _invoice_output_path(source, invoice)
+    except (OSError, ValueError):
+        output_path = DEFAULT_OUTPUT_DIR / f"{_invoice_output_stem(source, source.stem)}_effi.xlsx"
     reviewed_path = output_path.with_name(output_path.stem.removesuffix("_effi") + "_revisado.xlsx")
     _invalidate_reviewed_workbook(reviewed_path)
 
@@ -1312,7 +1319,7 @@ def _draft_workbook_data(
         temporary_original = Path(temporary_directory) / (
             original.name
             if original is not None
-            else f"{_safe_stem(queue_item['source'], queue_item['invoice'].invoice_id)}_effi.xlsx"
+            else f"{_invoice_output_stem(queue_item['source'], queue_item['invoice'].invoice_id, queue_item['invoice'].supplier_tax_id)}_effi.xlsx"
         )
         if original is not None and original.is_file():
             shutil.copyfile(original, temporary_original)
@@ -1410,7 +1417,7 @@ def _reviewed_workbook(
     if original is None or not original.is_file():
         from facturacion.generar_importacion import DEFAULT_TAX_CODES, DEFAULT_TEMPLATE, generate_workbook
 
-        original = DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
+        original = _invoice_output_path(source, invoice)
         generate_workbook(source, DEFAULT_TEMPLATE, original, DEFAULT_TAX_CODES)
     workbook = load_workbook(original)
     sheet = workbook[DETAIL_SHEET] if DETAIL_SHEET in workbook.sheetnames else workbook.active
@@ -1853,7 +1860,7 @@ def main() -> None:
             download_column.download_button(
                 "↓  Descargar Excel completo",
                 data=completed_workbook,
-                file_name=f"{_safe_stem(source, invoice.invoice_id)}_revisado.xlsx",
+                file_name=f"{_invoice_output_stem(source, invoice.invoice_id, invoice.supplier_tax_id)}_revisado.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key=f"complete_download_{source.name}",
@@ -2105,7 +2112,7 @@ def main() -> None:
             st.download_button(
                 f"Descargar borrador · Factura {invoice.invoice_id}",
                 data=draft_data,
-                file_name=f"{_safe_stem(source, invoice.invoice_id)}_borrador.xlsx",
+                file_name=f"{_invoice_output_stem(source, invoice.invoice_id, invoice.supplier_tax_id)}_borrador.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"draft_download_lote_{source.name}",
                 help="Disponible aunque falte GTIN; las coincidencias seguras quedan asignadas.",
@@ -2290,7 +2297,7 @@ def main() -> None:
 
     st.markdown("---")
     base_output = queue_item["output"] or (
-        DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
+        _invoice_output_path(source, invoice)
     )
     reviewed_path = base_output.with_name(base_output.stem.removesuffix("_effi") + "_revisado.xlsx")
 

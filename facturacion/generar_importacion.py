@@ -709,6 +709,12 @@ def _safe_stem(source: Path, invoice_id: str) -> str:
     return safe or source.stem
 
 
+def _invoice_output_stem(source: Path, invoice_id: str, supplier_tax_id: str = "") -> str:
+    base = _safe_stem(source, invoice_id)
+    origin = _safe_stem(source, supplier_tax_id or source.stem)
+    return f"{base}_{origin}" if origin != base else base
+
+
 def generate_workbook(
     source: Path,
     template: Path,
@@ -942,7 +948,9 @@ def main(argv: list[str] | None = None) -> int:
             continue
         try:
             invoice = invoices[source] if args.azure_lookup else parse_invoice(source)
-            destination = args.output_dir / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
+            destination = args.output_dir / (
+                f"{_invoice_output_stem(source, invoice.invoice_id, invoice.supplier_tax_id)}_effi.xlsx"
+            )
             warnings = generate_workbook(
                 source,
                 args.template,

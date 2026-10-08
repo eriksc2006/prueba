@@ -351,6 +351,42 @@ class InvoiceParsingTests(unittest.TestCase):
 
 
 class WorkbookGenerationTests(unittest.TestCase):
+    def test_cli_output_path_distinguishes_providers_with_same_invoice_number(self) -> None:
+        from types import SimpleNamespace
+
+        from facturacion.generar_importacion import main
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "xml"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            source_a = input_dir / "proveedor_a.xml"
+            source_b = input_dir / "proveedor_b.xml"
+            source_a.write_text("<Invoice />", encoding="utf-8")
+            source_b.write_text("<Invoice />", encoding="utf-8")
+            invoices = {
+                source_a: SimpleNamespace(invoice_id="123", supplier_tax_id="900123456", lines=()),
+                source_b: SimpleNamespace(invoice_id="123", supplier_tax_id="900654321", lines=()),
+            }
+
+            with (
+                patch("facturacion.generar_importacion.parse_invoice", side_effect=lambda source: invoices[source]),
+                patch("facturacion.generar_importacion.generate_workbook", return_value=[]) as generate,
+            ):
+                result = main([
+                    "--input", str(input_dir),
+                    "--template", str(TEMPLATE),
+                    "--output-dir", str(output_dir),
+                ])
+
+            destinations = [call.args[2] for call in generate.call_args_list]
+            self.assertEqual(result, 0)
+            self.assertEqual(len(destinations), 2)
+            self.assertNotEqual(destinations[0], destinations[1])
+            self.assertIn("900123456", destinations[0].name)
+            self.assertIn("900654321", destinations[1].name)
+
     def test_completed_workbook_download_builds_missing_base_workbook(self) -> None:
         from io import BytesIO
 
