@@ -862,12 +862,13 @@ def generate_workbook(
             line, tax_codes, product_ids_by_barcode, product_ids_by_description, invoice.supplier_name
         )
     ]
-    warnings.extend(
-        f"Producto {lines[0].description or lines[0].item_code}: Bonificación consolidada; "
-        f"{_import_group_amounts(lines)[0]} unidades, costo efectivo {_import_group_amounts(lines)[1]} por unidad."
-        for lines in grouped_lines
-        if len(lines) > 1
-    )
+    for lines in grouped_lines:
+        if len(lines) > 1:
+            total_quantity, effective_cost, _, _ = _import_group_amounts(lines)
+            warnings.append(
+                f"Producto {lines[0].description or lines[0].item_code}: Bonificación consolidada; "
+                f"{total_quantity} unidades, costo efectivo {effective_cost} por unidad."
+            )
     return warnings
 
 

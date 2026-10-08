@@ -1045,6 +1045,67 @@ class WorkbookGenerationTests(unittest.TestCase):
             source.write_text("<Invoice id='changed' />", encoding="utf-8")
             self.assertFalse(_invoice_approval_is_current(source, reviews))
 
+    def test_invoice_approval_rejects_a_stale_review_snapshot(self) -> None:
+        from facturacion import revisar_excepciones
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "invoice.xml"
+            source.write_text("<Invoice />", encoding="utf-8")
+            review_file = root / "reviews.json"
+            latest_reviews = {source.name: {"1": {"status": "confirmed", "product_id": 456}}}
+            stale_reviews = {source.name: {"1": {"status": "confirmed", "product_id": 123}}}
+            with patch.object(revisar_excepciones, "REVIEW_FILE", review_file):
+                revisar_excepciones._save_review_state(latest_reviews)
+                with self.assertRaisesRegex(RuntimeError, "cambiaron durante la aprobación"):
+                    revisar_excepciones._record_invoice_approval(
+                        stale_reviews, source, stale_reviews[source.name], "Ana"
+                    )
+
+                self.assertEqual(revisar_excepciones._load_review_state(), latest_reviews)
+
+    def test_invalid_review_state_is_not_silently_treated_as_empty(self) -> None:
+        from facturacion import revisar_excepciones
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            review_file = Path(temp_dir) / "reviews.json"
+            review_file.write_text("{invalid", encoding="utf-8")
+            with patch.object(revisar_excepciones, "REVIEW_FILE", review_file):
+                with self.assertRaisesRegex(RuntimeError, "revisiones manuales"):
+                    revisar_excepciones._load_review_state()
+
+            self.assertEqual(review_file.read_text(encoding="utf-8"), "{invalid")
+
+    def test_concurrent_review_updates_preserve_both_decisions(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        from facturacion import revisar_excepciones
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            review_file = root / "reviews.json"
+            source = root / "invoice.xml"
+            barrier = Barrier(2)
+
+            def record(line_id: str) -> None:
+                barrier.wait(timeout=5)
+                revisar_excepciones._record_review(
+                    {}, source, line_id, "confirmed", {"IdProducto": int(line_id)}, "Ana"
+                )
+
+            with (
+                patch.object(revisar_excepciones, "REVIEW_FILE", review_file),
+                patch.object(revisar_excepciones, "DEFAULT_OUTPUT_DIR", root),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [executor.submit(record, line_id) for line_id in ("1", "2")]
+                for future in futures:
+                    future.result(timeout=10)
+                saved_reviews = revisar_excepciones._load_review_state()[source.name]
+                self.assertEqual(saved_reviews["1"]["status"], "confirmed")
+                self.assertEqual(saved_reviews["2"]["status"], "confirmed")
+
     def test_invalidated_reviewed_workbook_is_versioned(self) -> None:
         from facturacion.revisar_excepciones import _invalidate_reviewed_workbook
 
@@ -1073,7 +1134,10 @@ class WorkbookGenerationTests(unittest.TestCase):
             reviewed = output.with_name(output.stem.removesuffix("_effi") + "_revisado.xlsx")
             reviewed.write_bytes(b"reviewed workbook")
 
-            with patch.object(revisar_excepciones, "DEFAULT_OUTPUT_DIR", temp_output):
+            with (
+                patch.object(revisar_excepciones, "DEFAULT_OUTPUT_DIR", temp_output),
+                patch.object(revisar_excepciones, "REVIEW_FILE", temp_output / "reviews.json"),
+            ):
                 _record_review(state, source, "1", "confirmed", None, "Ana", invoice_id="invoice")
 
             self.assertNotIn(INVOICE_APPROVAL_KEY, state[source.name])

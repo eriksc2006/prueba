@@ -15,9 +15,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import closing, contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
@@ -117,16 +119,57 @@ def _load_review_state() -> dict[str, Any]:
     if not REVIEW_FILE.is_file():
         return {}
     try:
-        return json.loads(REVIEW_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+        state = json.loads(REVIEW_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"No se pudo leer el archivo de revisiones manuales {REVIEW_FILE}; "
+            "se preservó para evitar perder decisiones existentes."
+        ) from error
+    if not isinstance(state, dict):
+        raise RuntimeError(
+            f"El archivo de revisiones manuales {REVIEW_FILE} no contiene un objeto JSON."
+        )
+    return state
 
 
 def _save_review_state(state: dict[str, Any]) -> None:
     REVIEW_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = REVIEW_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    os.replace(temporary, REVIEW_FILE)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=REVIEW_FILE.parent,
+            prefix=f".{REVIEW_FILE.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(state, temporary, ensure_ascii=False, indent=2, default=str)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, REVIEW_FILE)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+@contextmanager
+def _review_state_transaction(state: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
+    REVIEW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = REVIEW_FILE.with_suffix(REVIEW_FILE.suffix + ".lock")
+    with closing(sqlite3.connect(lock_file, timeout=30)) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            latest_state = _load_review_state()
+            original = json.dumps(latest_state, ensure_ascii=False, sort_keys=True, default=str)
+            yield latest_state
+            updated = json.dumps(latest_state, ensure_ascii=False, sort_keys=True, default=str)
+            if updated != original:
+                _save_review_state(latest_state)
+    if state is not None:
+        state.clear()
+        state.update(latest_state)
 
 
 def _invalidate_reviewed_workbook(path: Path) -> Path | None:
@@ -281,17 +324,14 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
         )
         generated_sources.append(source.name)
 
-    review_state = _load_review_state()
-    approval_invalidated = False
-    for source, invoice, output in parsed_invoices:
-        invoice_reviews = review_state.get(source.name, {})
-        if invoice_reviews.pop(INVOICE_APPROVAL_KEY, None) is not None:
-            approval_invalidated = True
-        reviewed_path = output.with_name(output.stem.removesuffix("_effi") + "_revisado.xlsx")
-        if reviewed_path.is_file():
-            _invalidate_reviewed_workbook(reviewed_path)
-    if approval_invalidated:
-        _save_review_state(review_state)
+    with _review_state_transaction() as review_state:
+        for source, invoice, output in parsed_invoices:
+            invoice_reviews = review_state.get(source.name, {})
+            if isinstance(invoice_reviews, dict):
+                invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
+            reviewed_path = output.with_name(output.stem.removesuffix("_effi") + "_revisado.xlsx")
+            if reviewed_path.is_file():
+                _invalidate_reviewed_workbook(reviewed_path)
     _cached_invoice_queue.cache_clear()
 
     all_barcodes = [line.barcode for invoice in invoices for line in invoice.lines if line.barcode]
@@ -372,22 +412,28 @@ def _invoice_approval_is_current(source: Path, invoice_reviews: dict[str, Any]) 
 def _record_invoice_approval(
     state: dict[str, Any], source: Path, invoice_reviews: dict[str, Any], approver: str
 ) -> None:
-    approval_history = invoice_reviews.setdefault(INVOICE_APPROVAL_HISTORY_KEY, [])
-    previous_approval = invoice_reviews.get(INVOICE_APPROVAL_KEY)
-    if previous_approval and (
-        not approval_history or approval_history[-1].get("approved_at") != previous_approval.get("approved_at")
-    ):
-        approval_history.append(previous_approval)
-    approval = {
-        "status": "approved",
-        "approved_by": approver.strip(),
-        "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "fingerprint": _approval_fingerprint(source, invoice_reviews),
-    }
-    approval_history.append(approval)
-    invoice_reviews[INVOICE_APPROVAL_KEY] = approval
-    state[source.name] = invoice_reviews
-    _save_review_state(state)
+    expected_fingerprint = _approval_fingerprint(source, invoice_reviews)
+    with _review_state_transaction(state) as latest_state:
+        latest_reviews = latest_state.setdefault(source.name, {})
+        if _approval_fingerprint(source, latest_reviews) != expected_fingerprint:
+            raise RuntimeError(
+                "Las decisiones de la factura cambiaron durante la aprobación; "
+                "actualiza la revisión y vuelve a aprobar."
+            )
+        approval_history = latest_reviews.setdefault(INVOICE_APPROVAL_HISTORY_KEY, [])
+        previous_approval = latest_reviews.get(INVOICE_APPROVAL_KEY)
+        if previous_approval and (
+            not approval_history or approval_history[-1].get("approved_at") != previous_approval.get("approved_at")
+        ):
+            approval_history.append(previous_approval)
+        approval = {
+            "status": "approved",
+            "approved_by": approver.strip(),
+            "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "fingerprint": _approval_fingerprint(source, latest_reviews),
+        }
+        approval_history.append(approval)
+        latest_reviews[INVOICE_APPROVAL_KEY] = approval
 
 
 def _read_exception_rows(path: Path) -> list[dict[str, Any]]:
@@ -661,17 +707,17 @@ def _record_review(
     reviewed_by: str = "",
     invoice_id: str | None = None,
 ) -> None:
-    invoice_reviews = state.setdefault(source.name, {})
-    invoice_reviews[line_id] = {
-        "status": status,
-        "product_id": product.get("IdProducto") if product else None,
-        "product_name": product.get("Nombre") if product else None,
-        "reference": product.get("Referencia") if product else None,
-        "reviewed_by": reviewed_by.strip(),
-        "reviewed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
-    _save_review_state(state)
+    with _review_state_transaction(state) as latest_state:
+        invoice_reviews = latest_state.setdefault(source.name, {})
+        invoice_reviews[line_id] = {
+            "status": status,
+            "product_id": product.get("IdProducto") if product else None,
+            "product_name": product.get("Nombre") if product else None,
+            "reference": product.get("Referencia") if product else None,
+            "reviewed_by": reviewed_by.strip(),
+            "reviewed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
     try:
         invoice = parse_invoice(source)
         output_path = _invoice_output_path(source, invoice)
@@ -692,19 +738,19 @@ def _record_cost_review(
     bonus_link_line: str | None,
     reviewed_by: str = "",
 ) -> None:
-    invoice_reviews = state.setdefault(source.name, {})
-    line_review = invoice_reviews.setdefault(line_id, {})
-    line_review.update({
-        "final_unit_cost": str(final_unit_cost),
-        "is_bonus": is_bonus,
-        "bonus_link_line": bonus_link_line if is_bonus else None,
-        "cost_saved_by": reviewed_by.strip(),
-        "cost_saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
-    if line_review.get("status") not in {"confirmed", "no_match"}:
-        line_review["status"] = "cost_saved"
-    invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
-    _save_review_state(state)
+    with _review_state_transaction(state) as latest_state:
+        invoice_reviews = latest_state.setdefault(source.name, {})
+        line_review = invoice_reviews.setdefault(line_id, {})
+        line_review.update({
+            "final_unit_cost": str(final_unit_cost),
+            "is_bonus": is_bonus,
+            "bonus_link_line": bonus_link_line if is_bonus else None,
+            "cost_saved_by": reviewed_by.strip(),
+            "cost_saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        if line_review.get("status") not in {"confirmed", "no_match"}:
+            line_review["status"] = "cost_saved"
+        invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
     try:
         invoice = parse_invoice(source)
         output_path = _invoice_output_path(source, invoice)
