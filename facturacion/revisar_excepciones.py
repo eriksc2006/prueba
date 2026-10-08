@@ -34,6 +34,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from facturacion.azure_codes import (
+    get_product_by_description,
     get_product_ids_by_descriptions,
     search_products,
     search_products_by_barcode,
@@ -1619,6 +1620,11 @@ def main() -> None:
     )
 
     st.session_state["invoice_auto_generation_checked_v2"] = True
+
+    try:
+        _sync_invoice_workbooks(force=True)
+    except Exception as error:
+        st.session_state["invoice_sync_error"] = str(error)
 
     queue = _invoice_queue()
     if not queue:
