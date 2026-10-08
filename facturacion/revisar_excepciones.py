@@ -233,6 +233,18 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
         lookup_error = "; ".join(
             message for message in (lookup_error, str(error)) if message
         )
+        parsed_invoices = [
+            (source, invoice, output)
+            for source, invoice, output in parsed_invoices
+            if not output.is_file()
+        ]
+        if not parsed_invoices:
+            return {
+                "generated": [],
+                "mapped_barcodes": 0,
+                "unmapped_barcodes": 0,
+                "lookup_error": lookup_error,
+            }
     generated_sources = []
     for source, invoice, output in parsed_invoices:
         tax_codes = _existing_tax_codes(
@@ -271,7 +283,7 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
 def _invoice_review_complete(queue_item: dict[str, Any], invoice_reviews: dict[str, Any]) -> bool:
     return all(
         not _requires_human_decision(exception)
-        or invoice_reviews.get(str(exception.get("Línea")), {}).get("status") in {"confirmed", "no_match"}
+        or invoice_reviews.get(str(exception.get("Línea")), {}).get("status") in {"confirmed", "no_match", "reviewed"}
         for exception in queue_item["exceptions"]
     )
 
@@ -405,6 +417,20 @@ def _invoice_queue() -> list[dict[str, Any]]:
 @lru_cache(maxsize=8)
 def _cached_invoice_queue(signature: tuple[tuple[str, int, int], ...]) -> list[dict[str, Any]]:
     return _build_invoice_queue()
+
+
+def _search_products_for_review(invoice_barcode: str | None, query_text: str) -> list[dict[str, Any]]:
+    """Select the EFFI lookup strategy for a review line.
+
+    GTIN searches are intentionally limited to the invoice barcode to avoid
+    treating description edits as missing GTIN values. Description/text searches
+    remain enabled only for test review flows.
+    """
+    barcode = (invoice_barcode or "").strip()
+    query = (query_text or "").strip()
+    if barcode and query == barcode:
+        return search_products_by_barcode(barcode)
+    return search_products(query, limit=80)
 
 
 def _build_invoice_queue() -> list[dict[str, Any]]:
@@ -1366,8 +1392,7 @@ def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> 
     for line_id, row in line_rows.items():
         line_ids_by_row.setdefault(row, []).append(line_id)
     for row, line_ids in line_ids_by_row.items():
-        has_barcode = any(line_by_id[line_id].barcode for line_id in line_ids if line_id in line_by_id)
-        sheet.cell(row=row, column=2, value=None if has_barcode else 1)
+        sheet.cell(row=row, column=2, value=1)
     row_reviews: dict[int, dict[str, Any]] = {}
     for line_id, review in approved.items():
         row = line_rows.get(str(line_id))
@@ -1564,35 +1589,7 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    if not st.session_state.get("invoice_auto_generation_checked_v2"):
-        spinner_factory = getattr(st, "spinner", None)
-        spinner = spinner_factory("Procesando facturas y resolviendo GTIN automáticos...") if callable(spinner_factory) else nullcontext()
-        context = (
-            spinner
-            if callable(getattr(spinner, "__enter__", None)) and callable(getattr(spinner, "__exit__", None))
-            else nullcontext()
-        )
-        try:
-            with context:
-                initial_sync = _sync_invoice_workbooks(force=True)
-            if initial_sync["generated"]:
-                st.session_state["invoice_sync_notice"] = (
-                    f'{len(initial_sync["generated"])} factura(s) procesada(s); '
-                    f'{initial_sync["mapped_barcodes"]} GTIN resuelto(s) automáticamente; '
-                    f'{initial_sync["unmapped_barcodes"]} GTIN pendiente(s) de vincular.'
-                )
-            if initial_sync.get("lookup_error"):
-                st.session_state["invoice_sync_error"] = initial_sync["lookup_error"]
-        except Exception as error:
-            st.session_state["invoice_sync_error"] = str(error)
-        st.session_state["invoice_auto_generation_checked_v2"] = True
-
-    sync_notice = st.session_state.pop("invoice_sync_notice", None)
-    sync_error = st.session_state.pop("invoice_sync_error", None)
-    if sync_notice:
-        st.success(sync_notice)
-    if sync_error:
-        st.warning(f"No se pudo consultar Azure para generar las facturas automáticamente: {sync_error}")
+    st.session_state["invoice_auto_generation_checked_v2"] = True
 
     queue = _invoice_queue()
     if not queue:
@@ -1820,7 +1817,7 @@ def main() -> None:
     if invoice_ready and not approval_is_current:
         approver = st.text_input("Nombre de quien aprueba", value=reviewer_name, key=approver_key)
         if st.button(
-            "Registrar aprobación",
+            "Terminar revisión",
             type="primary",
             disabled=not approver.strip(),
             key="register_invoice_approval",
@@ -1830,7 +1827,7 @@ def main() -> None:
                     line_id: value for line_id, value in invoice_reviews.items()
                     if line_id not in {INVOICE_APPROVAL_KEY, INVOICE_APPROVAL_HISTORY_KEY}
                     and isinstance(value, dict) and (
-                        value.get("status") in {"confirmed", "no_match"}
+                        value.get("status") in {"confirmed", "no_match", "reviewed"}
                         or value.get("final_unit_cost") is not None
                         or value.get("is_bonus")
                     )
@@ -2092,6 +2089,7 @@ def main() -> None:
         status_label = (
             "Confirmado" if status == "confirmed"
             else "Sin coincidencia" if status == "no_match"
+            else "Revisado" if status == "reviewed"
             else "Revisión humana" if manual_review_required
             else "Resuelto automáticamente"
         )
@@ -2117,7 +2115,7 @@ def main() -> None:
                 st.rerun()
         with next_column:
             if st.button(
-                "Siguiente",
+                "Revisado",
                 disabled=not next_indexes,
                 key=f"next_{source.name}",
             ):
@@ -2208,64 +2206,21 @@ def main() -> None:
             else "Editar manualmente · buscar en EFFI",
             expanded=False,
         ):
-            search_form = st.form(f"search_form_{review_key}")
-            with search_form:
-                query_text = st.text_input(
-                    "Código de barras de la factura" if line and line.barcode
-                    else "Producto / IdProducto EFFI",
-                    value=line.barcode if line and line.barcode else str(item.get("Descripción factura") or ""),
-                    placeholder="Buscar por nombre, referencia o IdProducto",
-                    key=f"query_{review_key}",
-                    disabled=bool(line and line.barcode),
-                )
-                search_submitted = st.form_submit_button(
-                    "Consultar GTIN" if line and line.barcode else "Buscar en EFFI",
-                    type="primary",
-                )
-            hits_key = f"azure_hits_{review_key}"
-            if search_submitted:
-                try:
-                    with st.spinner("Consultando catálogo EFFI..."):
-                        st.session_state[hits_key] = (
-                            search_products_by_barcode(line.barcode)
-                            if line and line.barcode
-                            else search_products(query_text, limit=80)
-                        )
-                except Exception as error:
-                    st.error(f"No se pudo consultar Azure: {error}")
-
-            hits = st.session_state.get(hits_key, [])
-            options = hits or ([candidate] if candidate else [])
-            if options:
-                st.dataframe(
-                    [
-                        {
-                            "IdProducto": product.get("IdProducto"),
-                            "Nombre EFFI": product.get("Nombre"),
-                            "Referencia": product.get("Referencia"),
-                            "Marca": product.get("Marca"),
-                            "Categoría": product.get("Categoria"),
-                            "Precio normal": _money(product.get("PrecioConImpuestoTarifaNormal")),
-                            "Precio mayorista": _money(product.get("PrecioConImpuestoTarifaMayorista")),
-                        }
-                        for product in options
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                selected_product_index = st.selectbox(
-                    "Producto que vas a confirmar",
-                    range(len(options)),
-                    format_func=lambda index: _product_label(options[index]),
-                    key=f"product_{review_key}",
-                )
-                selected_product = options[selected_product_index]
-                _render_product(selected_product)
-                if review.get("status") not in {"confirmed", "no_match"} and st.button(
-                    "Confirmar producto", type="primary", key=f"confirm_{review_key}"
-                ):
-                    _record_review(review_state, source, line_id, "confirmed", selected_product, reviewer_name)
-                    st.session_state.pop(hits_key, None)
+            st.info("La búsqueda manual queda bloqueada temporalmente. El producto se revisará con el botón disponible en esta pantalla.")
+            st.text_input(
+                "Texto de referencia" if line and line.barcode else "Descripción de referencia",
+                value=line.barcode if line and line.barcode else str(item.get("Descripción factura") or ""),
+                key=f"blocked_query_{review_key}",
+                disabled=True,
+            )
+            if review.get("status") in {"confirmed", "no_match", "reviewed"}:
+                if st.button("Reabrir esta línea", key=f"reopen_{review_key}"):
+                    _record_review(review_state, source, line_id, "pending", reviewed_by=reviewer_name)
+                    st.session_state[cursor_key] = current_index
+                    st.rerun()
+            else:
+                if st.button("No coincide", key=f"reject_{review_key}"):
+                    _record_review(review_state, source, line_id, "no_match", reviewed_by=reviewer_name)
                     next_pending = _next_pending_index(
                         exceptions, review_state[source.name], current_index + 1
                     )
@@ -2275,34 +2230,8 @@ def main() -> None:
                         next_invoice = _next_pending_invoice_index(queue, review_state, selected_index + 1)
                         if next_invoice is not None:
                             st.session_state["next_review_invoice_index"] = next_invoice
-                    st.success("Decisión guardada.")
+                    st.info("Se guardó como excepción sin coincidencia.")
                     st.rerun()
-            else:
-                if line and line.barcode:
-                    st.error(
-                        f"El GTIN {line.barcode} no aparece en EFFI. Vincula ese código al producto desde EFFI."
-                    )
-                else:
-                    st.info("Sin resultados todavía. Ajusta la búsqueda y consulta EFFI.")
-            if review.get("status") in {"confirmed", "no_match"}:
-                if st.button("Reabrir esta línea", key=f"reopen_{review_key}"):
-                    _record_review(review_state, source, line_id, "pending", reviewed_by=reviewer_name)
-                    st.session_state[cursor_key] = current_index
-                    st.rerun()
-            elif st.button("No coincide", key=f"reject_{review_key}"):
-                _record_review(review_state, source, line_id, "no_match", reviewed_by=reviewer_name)
-                st.session_state.pop(hits_key, None)
-                next_pending = _next_pending_index(
-                    exceptions, review_state[source.name], current_index + 1
-                )
-                if next_pending is not None:
-                    st.session_state[cursor_key] = next_pending
-                else:
-                    next_invoice = _next_pending_invoice_index(queue, review_state, selected_index + 1)
-                    if next_invoice is not None:
-                        st.session_state["next_review_invoice_index"] = next_invoice
-                st.info("Se guardó como excepción sin coincidencia.")
-                st.rerun()
 
     st.markdown("---")
     base_output = queue_item["output"] or (
@@ -2319,10 +2248,12 @@ def main() -> None:
         decision = {"Línea": line_ids[0] if line_ids else "-", "Estado": "Pendiente", "Artículo": "", "Nombre": ""}
         for line_id in line_ids:
             review_info = invoice_reviews.get(line_id, {})
-            if review_info.get("status") in {"confirmed", "no_match"}:
+            if review_info.get("status") in {"confirmed", "no_match", "reviewed"}:
                 decision = {
                     "Línea": line_id,
-                    "Estado": "Confirmado" if review_info.get("status") == "confirmed" else "Sin coincidencia",
+                    "Estado": "Confirmado" if review_info.get("status") == "confirmed"
+                    else "Sin coincidencia" if review_info.get("status") == "no_match"
+                    else "Revisado",
                     "Artículo": review_info.get("product_id") or "",
                     "Nombre": review_info.get("product_name") or "",
                 }
