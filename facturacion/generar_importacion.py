@@ -656,7 +656,7 @@ def _write_detail(
             import_row_by_line[source_line.line_id] = row_number
         values = (
             resolved_id,                # A: EFFI article ID
-            1,                          # B: ID Tipo de Egreso (default for all draft rows)
+            None,                       # B: leave blank; Azure barcode mapping does not populate this column
             None,                       # C: lot (not in DIAN UBL)
             None,                       # D: serial (not in DIAN UBL)
             None,                       # E: observation (kept for manual entry)

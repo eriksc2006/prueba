@@ -1619,12 +1619,13 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.session_state["invoice_auto_generation_checked_v2"] = True
-
-    try:
-        _sync_invoice_workbooks(force=True)
-    except Exception as error:
-        st.session_state["invoice_sync_error"] = str(error)
+    checked = st.session_state.get("invoice_auto_generation_checked_v2")
+    if not checked:
+        try:
+            _sync_invoice_workbooks(force=True)
+        except Exception as error:
+            st.session_state["invoice_sync_error"] = str(error)
+        st.session_state["invoice_auto_generation_checked_v2"] = True
 
     queue = _invoice_queue()
     if not queue:

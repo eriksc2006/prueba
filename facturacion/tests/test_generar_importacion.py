@@ -503,7 +503,7 @@ class WorkbookGenerationTests(unittest.TestCase):
         from facturacion import revisar_excepciones
 
         with patch.object(revisar_excepciones, "_invoice_queue", return_value=[]), \
-                patch.object(revisar_excepciones.st, "session_state", {}), \
+                patch.object(revisar_excepciones.st, "session_state", {"invoice_auto_generation_checked_v2": True}), \
                 patch.object(revisar_excepciones.st, "markdown"), \
                 patch.object(revisar_excepciones.st, "info"), \
                 patch.object(revisar_excepciones, "_sync_invoice_workbooks") as sync:
