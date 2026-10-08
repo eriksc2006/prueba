@@ -601,6 +601,23 @@ class WorkbookGenerationTests(unittest.TestCase):
             self.assertEqual(len(generated_files), 1)
             self.assertTrue(generated_files[0].is_file())
 
+    def test_invoice_output_path_distinguishes_providers_with_same_invoice_number(self) -> None:
+        from types import SimpleNamespace
+
+        from facturacion.revisar_excepciones import _invoice_output_path
+
+        source_a = Path("proveedor_a.xml")
+        source_b = Path("proveedor_b.xml")
+        invoice_a = SimpleNamespace(invoice_id="123", supplier_tax_id="900123456")
+        invoice_b = SimpleNamespace(invoice_id="123", supplier_tax_id="900654321")
+
+        output_a = _invoice_output_path(source_a, invoice_a)
+        output_b = _invoice_output_path(source_b, invoice_b)
+
+        self.assertNotEqual(output_a, output_b)
+        self.assertIn("900123456", output_a.name)
+        self.assertIn("900654321", output_b.name)
+
     def test_sync_preserves_existing_article_ids_when_description_lookup_fails(self) -> None:
         from facturacion.generar_importacion import generate_workbook
         from facturacion.revisar_excepciones import _invoice_output_path, _sync_invoice_workbooks
@@ -615,35 +632,41 @@ class WorkbookGenerationTests(unittest.TestCase):
             output_dir = root / "output"
             xml_dir.mkdir()
             output_dir.mkdir()
-            output = output_dir / f"{invoice.invoice_id}_effi.xlsx"
-            (xml_dir / source.name).write_bytes(source.read_bytes())
-            initial_id = 98765
-            generate_workbook(
-                source,
-                TEMPLATE,
-                output,
-                DEFAULT_TAX_CODES,
-                product_ids_by_barcode={barcode: initial_id},
-                product_ids_by_description={},
-            )
+            temp_source = xml_dir / source.name
+            temp_source.write_bytes(source.read_bytes())
+            invoice = parse_invoice(temp_source)
             with (
                 patch("facturacion.revisar_excepciones.DEFAULT_XML_DIR", xml_dir),
                 patch("facturacion.revisar_excepciones.DEFAULT_OUTPUT_DIR", output_dir),
-                patch("facturacion.revisar_excepciones.REVIEW_FILE", output_dir / "reviews.json"),
-                patch("facturacion.revisar_excepciones._cached_barcode_product_ids", return_value={}),
-                patch(
-                    "facturacion.revisar_excepciones.get_product_ids_by_descriptions",
-                    side_effect=RuntimeError("Azure firewall blocked the description lookup"),
-                ),
-                patch("facturacion.revisar_excepciones._existing_tax_codes", return_value={}),
             ):
-                result = _sync_invoice_workbooks(force=True)
-                workbook = load_workbook(output, read_only=True, data_only=True)
-                try:
-                    detail = workbook["Hoja1"]
-                    self.assertEqual(detail.cell(2, 1).value, initial_id)
-                finally:
-                    workbook.close()
+                output = _invoice_output_path(temp_source, invoice)
+                initial_id = 98765
+                generate_workbook(
+                    temp_source,
+                    TEMPLATE,
+                    output,
+                    DEFAULT_TAX_CODES,
+                    product_ids_by_barcode={barcode: initial_id},
+                    product_ids_by_description={},
+                )
+                with (
+                    patch("facturacion.revisar_excepciones.DEFAULT_XML_DIR", xml_dir),
+                    patch("facturacion.revisar_excepciones.DEFAULT_OUTPUT_DIR", output_dir),
+                    patch("facturacion.revisar_excepciones.REVIEW_FILE", output_dir / "reviews.json"),
+                    patch("facturacion.revisar_excepciones._cached_barcode_product_ids", return_value={}),
+                    patch(
+                        "facturacion.revisar_excepciones.get_product_ids_by_descriptions",
+                        side_effect=RuntimeError("Azure firewall blocked the description lookup"),
+                    ),
+                    patch("facturacion.revisar_excepciones._existing_tax_codes", return_value={}),
+                ):
+                    result = _sync_invoice_workbooks(force=True)
+                    workbook = load_workbook(output, read_only=True, data_only=True)
+                    try:
+                        detail = workbook["Hoja1"]
+                        self.assertEqual(detail.cell(2, 1).value, initial_id)
+                    finally:
+                        workbook.close()
 
             self.assertIn("description lookup", result["lookup_error"])
             self.assertEqual(result["generated"], [])

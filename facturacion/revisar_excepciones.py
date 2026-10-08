@@ -147,7 +147,13 @@ def _invalidate_reviewed_workbook(path: Path) -> Path | None:
 
 
 def _invoice_output_path(source: Path, invoice: Any) -> Path:
-    return DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
+    invoice_id = _safe_stem(source, invoice.invoice_id)
+    supplier_id = _safe_stem(source, getattr(invoice, "supplier_tax_id", "") or "")
+    if supplier_id and supplier_id != invoice_id:
+        base = f"{invoice_id}_{supplier_id}"
+    else:
+        base = invoice_id
+    return DEFAULT_OUTPUT_DIR / f"{base}_effi.xlsx"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
