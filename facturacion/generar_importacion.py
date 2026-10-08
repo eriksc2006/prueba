@@ -656,7 +656,7 @@ def _write_detail(
             import_row_by_line[source_line.line_id] = row_number
         values = (
             resolved_id,                # A: EFFI article ID
-            1 if not any(source_line.barcode for source_line in source_lines) else None,  # B: expense type
+            1,                          # B: ID Tipo de Egreso (default for all draft rows)
             None,                       # C: lot (not in DIAN UBL)
             None,                       # D: serial (not in DIAN UBL)
             None,                       # E: observation (kept for manual entry)
@@ -917,11 +917,13 @@ def main(argv: list[str] | None = None) -> int:
             product_ids_by_barcode = get_product_ids_by_barcodes(
                 line.barcode for invoice in invoices.values() for line in invoice.lines if line.barcode
             )
+            # PRUEBAS: búsqueda por descripción habilitada temporalmente para validar
+            # coincidencias sin GTIN; no activar esta conducta en producción.
             product_ids_by_description = get_product_candidates_by_descriptions(
                 line.description
                 for invoice in invoices.values()
                 for line in invoice.lines
-                if line.description and not line.barcode
+                if line.description
             )
             print(f"Azure: {len(product_ids_by_barcode)} código(s) de barras asociado(s) a productos EFFI.")
             candidate_count = sum(len(products) for products in product_ids_by_description.values())
