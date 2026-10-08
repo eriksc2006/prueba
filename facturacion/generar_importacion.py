@@ -654,9 +654,14 @@ def _write_detail(
         quantity, import_price, import_discount, tax_line = _import_group_amounts(source_lines)
         for source_line in source_lines:
             import_row_by_line[source_line.line_id] = row_number
+        is_barcode_mapped = (
+            bool(line.barcode)
+            and product_ids_by_barcode is not None
+            and line.barcode in product_ids_by_barcode
+        )
         values = (
             resolved_id,                # A: EFFI article ID
-            None,                       # B: leave blank; Azure barcode mapping does not populate this column
+            None if is_barcode_mapped else 1,  # B: default exit type; leave blank for Azure barcode matches
             None,                       # C: lot (not in DIAN UBL)
             None,                       # D: serial (not in DIAN UBL)
             None,                       # E: observation (kept for manual entry)
