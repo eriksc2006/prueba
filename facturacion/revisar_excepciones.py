@@ -1254,13 +1254,21 @@ def _next_pending_invoice_index(
     return None
 
 
-def _apply_automatic_matches(workbook: Any, queue_item: dict[str, Any]) -> None:
+def _apply_automatic_matches(
+    workbook: Any,
+    queue_item: dict[str, Any],
+    include_match_sheet: bool = True,
+) -> None:
     detail = workbook[DETAIL_SHEET] if DETAIL_SHEET in workbook.sheetnames else workbook.active
     for match in queue_item.get("automatic_matches", []):
         row = queue_item["import_row_by_line"].get(match["line_id"])
         if row is not None and match.get("product_id") is not None:
             detail.cell(row=int(row), column=1, value=match["product_id"])
 
+    if not include_match_sheet:
+        if AUTOMATIC_MATCH_SHEET in workbook.sheetnames:
+            del workbook[AUTOMATIC_MATCH_SHEET]
+        return
     if AUTOMATIC_MATCH_SHEET in workbook.sheetnames:
         del workbook[AUTOMATIC_MATCH_SHEET]
     matches = queue_item.get("automatic_matches", [])
@@ -1313,6 +1321,7 @@ def _draft_workbook_data(
         draft_path = _reviewed_workbook(
             draft_queue,
             _draft_invoice_reviews(draft_queue, invoice_reviews),
+            include_automatic_matches=False,
         )
         return draft_path.read_bytes()
 
@@ -1384,7 +1393,11 @@ def _automatic_match_table_rows(queue_item: dict[str, Any]) -> list[dict[str, An
     return rows
 
 
-def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> Path:
+def _reviewed_workbook(
+    queue_item: dict[str, Any],
+    approved: dict[str, Any],
+    include_automatic_matches: bool = True,
+) -> Path:
     invoice = queue_item["invoice"]
     source = queue_item["source"]
     original = queue_item["output"]
@@ -1410,7 +1423,7 @@ def _reviewed_workbook(queue_item: dict[str, Any], approved: dict[str, Any]) -> 
             sanitized = _verified_article_id(article_value, line_by_id.get(line_id))
             if sanitized is None and sheet.cell(row=row, column=1).value is not None:
                 sheet.cell(row=row, column=1).value = None
-    _apply_automatic_matches(workbook, queue_item)
+    _apply_automatic_matches(workbook, queue_item, include_match_sheet=include_automatic_matches)
     for exception in _read_exception_rows(original):
         try:
             import_row = int(exception.get("Fila importación"))
