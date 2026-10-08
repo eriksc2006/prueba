@@ -233,8 +233,24 @@ class InvoiceParsingTests(unittest.TestCase):
         lookup.assert_called_once_with(["SAVITAL PROTEINAS"])
         self.assertEqual(candidates, {"savital proteinas": [product]})
 
+    def test_manual_description_uses_text_search_when_not_equal_to_invoice_gtin(self) -> None:
+        from facturacion.revisar_excepciones import _search_products_for_review
+
+        with patch("facturacion.revisar_excepciones.search_products_by_barcode") as barcode_lookup, patch(
+            "facturacion.revisar_excepciones.search_products"
+        ) as text_lookup:
+            _search_products_for_review("7701234567890", "SAVITAL PROTEINAS")
+            barcode_lookup.assert_not_called()
+            text_lookup.assert_called_once_with("SAVITAL PROTEINAS", limit=80)
+
+            barcode_lookup.reset_mock()
+            text_lookup.reset_mock()
+            _search_products_for_review("7701234567890", "7701234567890")
+            barcode_lookup.assert_called_once_with("7701234567890")
+            text_lookup.assert_not_called()
+
     def test_singular_description_lookup_rejects_ambiguous_results(self) -> None:
-        from facturacion.azure_codes import get_product_by_description
+        from facturacion.revisar_excepciones import get_product_by_description
 
         products = [{"IdProducto": 10}, {"IdProducto": 11}]
         with patch(
@@ -400,6 +416,11 @@ class WorkbookGenerationTests(unittest.TestCase):
             if detail.cell(row, 6).value is not None
         ]
         self.assertEqual(len(populated_rows), queue_item["product_count"])
+        self.assertTrue(all(
+            detail.cell(row, 2).value == 1
+            for row in range(2, detail.max_row + 1)
+            if detail.cell(row, 6).value is not None
+        ))
         workbook.close()
 
     def test_reviewer_queue_lists_all_invoices_and_consolidated_products(self) -> None:
@@ -415,6 +436,14 @@ class WorkbookGenerationTests(unittest.TestCase):
         bonus = next(product for product in products if product["barcode"] == "7702113048636")
         self.assertEqual(bonus["line_ids"], ["2", "3"])
         self.assertEqual(bonus["quantity"], Decimal("27.00"))
+
+    def test_reviewed_line_counts_as_complete_without_product_assignment(self) -> None:
+        from facturacion.revisar_excepciones import _invoice_review_complete
+
+        queue_item = {"exceptions": [{"Línea": "1"}, {"Línea": "2"}]}
+        invoice_reviews = {"1": {"status": "reviewed"}, "2": {"status": "confirmed", "product_id": 123}}
+
+        self.assertTrue(_invoice_review_complete(queue_item, invoice_reviews))
 
     def test_sync_generates_missing_invoice_offline_as_pending_review(self) -> None:
         from facturacion import revisar_excepciones
@@ -469,6 +498,18 @@ class WorkbookGenerationTests(unittest.TestCase):
             self.assertEqual(len(first_queue), 1)
             self.assertEqual(len(second_queue), 1)
             self.assertEqual(parse_spy.call_count, 1)
+
+    def test_opening_dashboard_does_not_forced_sync_azure(self) -> None:
+        from facturacion import revisar_excepciones
+
+        with patch.object(revisar_excepciones, "_invoice_queue", return_value=[]), \
+                patch.object(revisar_excepciones.st, "session_state", {}), \
+                patch.object(revisar_excepciones.st, "markdown"), \
+                patch.object(revisar_excepciones.st, "info"), \
+                patch.object(revisar_excepciones, "_sync_invoice_workbooks") as sync:
+            revisar_excepciones.main()
+
+        sync.assert_not_called()
 
     def test_invoice_sync_generates_excel_with_azure_barcode_ids(self) -> None:
         from facturacion.revisar_excepciones import _invoice_queue, _sync_invoice_workbooks
@@ -559,6 +600,54 @@ class WorkbookGenerationTests(unittest.TestCase):
             generated_files = list(output_dir.glob("*_effi.xlsx"))
             self.assertEqual(len(generated_files), 1)
             self.assertTrue(generated_files[0].is_file())
+
+    def test_sync_preserves_existing_article_ids_when_description_lookup_fails(self) -> None:
+        from facturacion.generar_importacion import generate_workbook
+        from facturacion.revisar_excepciones import _invoice_output_path, _sync_invoice_workbooks
+
+        source = XML_DIR / "ad080021284002726837920260926084002509.xml"
+        invoice = parse_invoice(source)
+        line = next(line for line in invoice.lines if line.barcode)
+        barcode = line.barcode
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            xml_dir = root / "xml"
+            output_dir = root / "output"
+            xml_dir.mkdir()
+            output_dir.mkdir()
+            output = output_dir / f"{invoice.invoice_id}_effi.xlsx"
+            (xml_dir / source.name).write_bytes(source.read_bytes())
+            initial_id = 98765
+            generate_workbook(
+                source,
+                TEMPLATE,
+                output,
+                DEFAULT_TAX_CODES,
+                product_ids_by_barcode={barcode: initial_id},
+                product_ids_by_description={},
+            )
+            with (
+                patch("facturacion.revisar_excepciones.DEFAULT_XML_DIR", xml_dir),
+                patch("facturacion.revisar_excepciones.DEFAULT_OUTPUT_DIR", output_dir),
+                patch("facturacion.revisar_excepciones.REVIEW_FILE", output_dir / "reviews.json"),
+                patch("facturacion.revisar_excepciones._cached_barcode_product_ids", return_value={}),
+                patch(
+                    "facturacion.revisar_excepciones.get_product_ids_by_descriptions",
+                    side_effect=RuntimeError("Azure firewall blocked the description lookup"),
+                ),
+                patch("facturacion.revisar_excepciones._existing_tax_codes", return_value={}),
+            ):
+                result = _sync_invoice_workbooks(force=True)
+                workbook = load_workbook(output, read_only=True, data_only=True)
+                try:
+                    detail = workbook["Hoja1"]
+                    self.assertEqual(detail.cell(2, 1).value, initial_id)
+                finally:
+                    workbook.close()
+
+            self.assertIn("description lookup", result["lookup_error"])
+            self.assertEqual(result["generated"], [])
+            self.assertEqual(result["mapped_barcodes"], 0)
 
     def test_prorates_bonus_units_for_repeated_barcode(self) -> None:
         source = XML_DIR / "ad089030295502726356720260928112521401.xml"
@@ -896,6 +985,44 @@ class WorkbookGenerationTests(unittest.TestCase):
             reviews["1"]["product_id"] = 123
             source.write_text("<Invoice id='changed' />", encoding="utf-8")
             self.assertFalse(_invoice_approval_is_current(source, reviews))
+
+    def test_invalidated_reviewed_workbook_is_versioned(self) -> None:
+        from facturacion.revisar_excepciones import _invalidate_reviewed_workbook
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reviewed = Path(temp_dir) / "invoice_revisado.xlsx"
+            reviewed.write_bytes(b"old workbook")
+
+            backup = _invalidate_reviewed_workbook(reviewed)
+
+            self.assertIsNotNone(backup)
+            self.assertFalse(reviewed.exists())
+            self.assertTrue(backup.exists())
+            self.assertTrue(backup.name.startswith("invoice_revisado_invalidado_"))
+
+    def test_decision_change_invalidates_approval_and_archives_reviewed_workbook(self) -> None:
+        from facturacion import revisar_excepciones
+        from facturacion.revisar_excepciones import INVOICE_APPROVAL_KEY, _record_review
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_output = Path(temp_dir)
+            source = temp_output / "invoice.xml"
+            source.write_text("<Invoice />", encoding="utf-8")
+            state = {source.name: {INVOICE_APPROVAL_KEY: {"status": "approved"}, "1": {"status": "confirmed"}}}
+            output = temp_output / "invoice_effi.xlsx"
+            output.write_bytes(b"base workbook")
+            reviewed = output.with_name(output.stem.removesuffix("_effi") + "_revisado.xlsx")
+            reviewed.write_bytes(b"reviewed workbook")
+
+            with patch.object(revisar_excepciones, "DEFAULT_OUTPUT_DIR", temp_output):
+                _record_review(state, source, "1", "confirmed", None, "Ana", invoice_id="invoice")
+
+            self.assertNotIn(INVOICE_APPROVAL_KEY, state[source.name])
+            self.assertFalse(reviewed.exists())
+            self.assertTrue(any(
+                backup.name.startswith("invoice_revisado_invalidado_")
+                for backup in temp_output.glob("*_revisado_invalidado_*.xlsx")
+            ))
 
     def test_dashboard_metrics_and_product_queue_use_invoice_review_data(self) -> None:
         from facturacion.revisar_excepciones import (

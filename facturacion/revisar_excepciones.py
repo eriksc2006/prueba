@@ -128,6 +128,23 @@ def _save_review_state(state: dict[str, Any]) -> None:
     os.replace(temporary, REVIEW_FILE)
 
 
+def _invalidate_reviewed_workbook(path: Path) -> Path | None:
+    """Archiva un Excel revisado cuyo lote o decisiones ya no coinciden con su fuente."""
+    if not path.is_file():
+        return None
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = path.with_name(f"{path.stem}_invalidado_{timestamp}{path.suffix}")
+    counter = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.stem}_invalidado_{timestamp}_{counter}{path.suffix}")
+        counter += 1
+    try:
+        os.replace(path, backup)
+    except OSError:
+        return None
+    return backup
+
+
 def _invoice_output_path(source: Path, invoice: Any) -> Path:
     return DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice.invoice_id)}_effi.xlsx"
 
@@ -262,10 +279,13 @@ def _sync_invoice_workbooks(force: bool = False) -> dict[str, Any]:
 
     review_state = _load_review_state()
     approval_invalidated = False
-    for source_name in generated_sources:
-        invoice_reviews = review_state.get(source_name, {})
+    for source, invoice, output in parsed_invoices:
+        invoice_reviews = review_state.get(source.name, {})
         if invoice_reviews.pop(INVOICE_APPROVAL_KEY, None) is not None:
             approval_invalidated = True
+        reviewed_path = output.with_name(output.stem.removesuffix("_effi") + "_revisado.xlsx")
+        if reviewed_path.is_file():
+            _invalidate_reviewed_workbook(reviewed_path)
     if approval_invalidated:
         _save_review_state(review_state)
     _cached_invoice_queue.cache_clear()
@@ -635,6 +655,7 @@ def _record_review(
     status: str,
     product: dict[str, Any] | None = None,
     reviewed_by: str = "",
+    invoice_id: str | None = None,
 ) -> None:
     invoice_reviews = state.setdefault(source.name, {})
     invoice_reviews[line_id] = {
@@ -645,7 +666,11 @@ def _record_review(
         "reviewed_by": reviewed_by.strip(),
         "reviewed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
     _save_review_state(state)
+    output_path = DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, invoice_id or source.stem)}_effi.xlsx"
+    reviewed_path = output_path.with_name(output_path.stem.removesuffix("_effi") + "_revisado.xlsx")
+    _invalidate_reviewed_workbook(reviewed_path)
 
 
 def _record_cost_review(
@@ -668,7 +693,11 @@ def _record_cost_review(
     })
     if line_review.get("status") not in {"confirmed", "no_match"}:
         line_review["status"] = "cost_saved"
+    invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
     _save_review_state(state)
+    output_path = DEFAULT_OUTPUT_DIR / f"{_safe_stem(source, source.stem)}_effi.xlsx"
+    reviewed_path = output_path.with_name(output_path.stem.removesuffix("_effi") + "_revisado.xlsx")
+    _invalidate_reviewed_workbook(reviewed_path)
 
 
 def _line_product_key(line: Any) -> tuple[str, str]:
@@ -1792,7 +1821,7 @@ def main() -> None:
             except Exception as error:
                 st.session_state["invoice_sync_error"] = str(error)
             st.rerun()
-    if invoice_ready:
+    if invoice_ready and approval_is_current:
         completed_workbook = _draft_workbook_data(queue_item, invoice_reviews)
         if completed_workbook is not None:
             download_column.download_button(
@@ -1802,7 +1831,7 @@ def main() -> None:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key=f"complete_download_{source.name}",
-                help="Descarga el Excel completo de esta factura con las decisiones revisadas.",
+                help="Descarga el Excel completo de esta factura con las decisiones revisadas y una aprobación vigente.",
             )
         else:
             download_column.warning("No se pudo preparar el Excel de esta factura.")
@@ -1812,7 +1841,7 @@ def main() -> None:
             use_container_width=True,
             disabled=True,
             key=f"complete_download_disabled_{source.name}",
-            help="Se habilita al terminar la revisión de esta factura.",
+            help="Se habilita al terminar la revisión y registrar una aprobación vigente.",
         )
     if invoice_ready and not approval_is_current:
         approver = st.text_input("Nombre de quien aprueba", value=reviewer_name, key=approver_key)
@@ -2331,30 +2360,20 @@ def main() -> None:
             help="Disponible aunque falte un GTIN; las coincidencias automáticas seguras quedan asignadas y las demás líneas permanecen pendientes.",
         )
 
-    if reviewed_path.is_file():
-        st.success(f"Ya existe el Excel generado: {reviewed_path.name}")
-        st.download_button(
-            "Descargar Excel revisado",
-            data=reviewed_path.read_bytes(),
-            file_name=reviewed_path.name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    elif base_output.is_file():
-        st.info(f"Excel base generado: {base_output.name}. Falta aprobación para producir el archivo revisado.")
-    else:
-        st.info("Aún no existe ningún Excel para esta factura; se generará automáticamente cuando se procese la bandeja.")
-
     if approval_is_current and reviewed_path.is_file():
-        st.success(
-            f"Aprobada por {invoice_reviews[INVOICE_APPROVAL_KEY].get('approved_by', 'Sin nombre')} · "
-            f"{reviewed_path.name}"
-        )
+        st.success(f"Aprobada por {invoice_reviews[INVOICE_APPROVAL_KEY].get('approved_by', 'Sin nombre')} · {reviewed_path.name}")
         st.download_button(
             "Descargar Excel aprobado",
             data=reviewed_path.read_bytes(),
             file_name=reviewed_path.name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    elif reviewed_path.is_file():
+        st.warning("Hay un Excel revisado, pero su aprobación ya no es vigente. Sincronice el archivo para generar una versión actualizada.")
+    elif base_output.is_file():
+        st.info(f"Excel base generado: {base_output.name}. Falta aprobación para producir el archivo revisado.")
+    else:
+        st.info("Aún no existe ningún Excel para esta factura; se generará automáticamente cuando se procese la bandeja.")
 
 
 if __name__ == "__main__":
