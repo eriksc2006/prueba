@@ -940,6 +940,130 @@ class WorkbookGenerationTests(unittest.TestCase):
                     },
                 )
 
+    def test_reviewed_workbook_splits_pack_cost_into_linked_invoice_product(self) -> None:
+        from facturacion.generar_importacion import _group_import_lines
+        from facturacion.revisar_excepciones import _reviewed_workbook
+
+        source = XML_DIR / "ad0811042361016260008d748.xml"
+        invoice = parse_invoice(source)
+        groups = _group_import_lines(invoice, None, None)
+        priced_groups = [
+            group for group in groups
+            if sum((line.net_amount for line in group), Decimal("0")) > 0
+        ]
+        self.assertGreaterEqual(len(priced_groups), 2)
+        source_lines, target_lines = priced_groups[:2]
+        source_line = source_lines[0]
+        target_line = target_lines[0]
+        source_row = groups.index(source_lines) + 2
+        target_row = groups.index(target_lines) + 2
+        line_rows = {
+            str(line.line_id): row
+            for row, group in enumerate(groups, start=2)
+            for line in group
+        }
+        component_unit_cost = source_line.net_amount / source_line.quantity / Decimal("4")
+        component_quantity = source_line.quantity
+        allocated_cost = component_quantity * component_unit_cost
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "pack_split.xlsx"
+            generate_workbook(source, TEMPLATE, output, DEFAULT_TAX_CODES)
+            original_workbook = load_workbook(output, data_only=True)
+            original_detail = original_workbook["Hoja1"]
+            source_quantity = Decimal(str(original_detail.cell(source_row, 6).value))
+            source_net = source_quantity * Decimal(str(original_detail.cell(source_row, 7).value))
+            target_quantity = Decimal(str(original_detail.cell(target_row, 6).value))
+            target_net = target_quantity * Decimal(str(original_detail.cell(target_row, 7).value))
+            original_workbook.close()
+
+            reviewed = _reviewed_workbook(
+                {
+                    "invoice": invoice,
+                    "source": source,
+                    "output": output,
+                    "import_row_by_line": line_rows,
+                    "article_ids": {
+                        str(source_line.line_id): 101,
+                        str(target_line.line_id): 202,
+                    },
+                },
+                {
+                    str(source_line.line_id): {
+                        "status": "confirmed",
+                        "product_id": 101,
+                        "pack_split": {
+                            "component_line": str(target_line.line_id),
+                            "units_per_pack": "1",
+                            "component_unit_cost": str(component_unit_cost),
+                        },
+                    },
+                    str(target_line.line_id): {"status": "confirmed", "product_id": 202},
+                },
+            )
+            reviewed_workbook = load_workbook(reviewed, data_only=True)
+            detail = reviewed_workbook["Hoja1"]
+            self.assertEqual(Decimal(str(detail.cell(source_row, 6).value)), source_quantity)
+            self.assertEqual(Decimal(str(detail.cell(target_row, 6).value)), target_quantity + component_quantity)
+            reviewed_source_net = source_quantity * Decimal(str(detail.cell(source_row, 7).value))
+            reviewed_target_net = (target_quantity + component_quantity) * Decimal(
+                str(detail.cell(target_row, 7).value)
+            )
+            self.assertAlmostEqual(
+                float(reviewed_source_net), float(source_net - allocated_cost), places=6
+            )
+            self.assertAlmostEqual(
+                float(reviewed_target_net), float(target_net + allocated_cost), places=6
+            )
+            self.assertAlmostEqual(
+                float(reviewed_source_net + reviewed_target_net), float(source_net + target_net), places=6
+            )
+            reviewed_workbook.close()
+
+            external_product_id = 987654321
+            external_reviewed = _reviewed_workbook(
+                {
+                    "invoice": invoice,
+                    "source": source,
+                    "output": output,
+                    "import_row_by_line": line_rows,
+                    "article_ids": {str(source_line.line_id): 101},
+                },
+                {
+                    str(source_line.line_id): {
+                        "status": "confirmed",
+                        "product_id": 101,
+                        "pack_split": {
+                            "component_product_id": external_product_id,
+                            "component_product_name": "Producto incluido",
+                            "units_per_pack": "1",
+                            "component_unit_cost": str(component_unit_cost),
+                        },
+                    },
+                },
+            )
+            external_workbook = load_workbook(external_reviewed, data_only=True)
+            external_detail = external_workbook["Hoja1"]
+            external_row = next(
+                row for row in range(2, external_detail.max_row + 1)
+                if external_detail.cell(row, 1).value == external_product_id
+            )
+            self.assertEqual(
+                Decimal(str(external_detail.cell(external_row, 6).value)), component_quantity
+            )
+            self.assertAlmostEqual(
+                float(external_detail.cell(external_row, 7).value),
+                float(component_unit_cost),
+                places=6,
+            )
+            external_source_net = source_quantity * Decimal(str(external_detail.cell(source_row, 7).value))
+            self.assertAlmostEqual(
+                float(external_source_net + component_quantity * component_unit_cost),
+                float(source_net),
+                places=6,
+            )
+            external_workbook.close()
+
     def test_final_imported_net_matches_all_sample_invoice_totals(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             for source in sorted(XML_DIR.glob("*.xml")):

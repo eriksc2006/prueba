@@ -391,7 +391,7 @@ def _approval_fingerprint(source: Path, invoice_reviews: dict[str, Any]) -> str:
     decisions = {
         line_id: {
             key: review.get(key)
-            for key in ("status", "product_id", "final_unit_cost", "is_bonus", "bonus_link_line")
+            for key in ("status", "product_id", "final_unit_cost", "is_bonus", "bonus_link_line", "pack_split")
         }
         for line_id, review in sorted(invoice_reviews.items())
         if line_id not in {INVOICE_APPROVAL_KEY, INVOICE_APPROVAL_HISTORY_KEY} and isinstance(review, dict)
@@ -766,6 +766,42 @@ def _record_cost_review(
     _invalidate_reviewed_workbook(reviewed_path)
 
 
+def _record_pack_split(
+    state: dict[str, Any],
+    source: Path,
+    line_id: str,
+    component_line: str | None,
+    component_product_id: Any | None,
+    component_product_name: str,
+    units_per_pack: Decimal,
+    component_unit_cost: Decimal,
+    reviewed_by: str = "",
+) -> None:
+    with _review_state_transaction(state) as latest_state:
+        invoice_reviews = latest_state.setdefault(source.name, {})
+        line_review = invoice_reviews.setdefault(line_id, {})
+        if component_line is None and component_product_id is None:
+            line_review.pop("pack_split", None)
+        else:
+            line_review["pack_split"] = {
+                "component_line": component_line,
+                "component_product_id": component_product_id,
+                "component_product_name": component_product_name,
+                "units_per_pack": str(units_per_pack),
+                "component_unit_cost": str(component_unit_cost),
+                "reviewed_by": reviewed_by.strip(),
+                "reviewed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        invoice_reviews.pop(INVOICE_APPROVAL_KEY, None)
+    try:
+        invoice = parse_invoice(source)
+        output_path = _invoice_output_path(source, invoice)
+    except (OSError, ValueError):
+        output_path = DEFAULT_OUTPUT_DIR / f"{_invoice_output_stem(source, source.stem)}_effi.xlsx"
+    reviewed_path = output_path.with_name(output_path.stem.removesuffix("_effi") + "_revisado.xlsx")
+    _invalidate_reviewed_workbook(reviewed_path)
+
+
 def _line_product_key(line: Any) -> tuple[str, str]:
     if line.barcode:
         return "barcode", line.barcode
@@ -1046,6 +1082,160 @@ def _render_cost_editor(
         st.success("Costo y bonificación guardados.")
         st.rerun()
 
+def _render_pack_split_editor(
+    source: Path,
+    line: Any,
+    invoice_reviews: dict[str, Any],
+    review_state: dict[str, Any],
+    line_by_id: dict[str, Any],
+    product_row_by_line: dict[str, dict[str, Any]],
+    reviewer_name: str,
+) -> None:
+    line_id = str(line.line_id)
+    product_row = product_row_by_line[line_id]
+    saved_split = invoice_reviews.get(line_id, {}).get("pack_split", {})
+    split_targets = [
+        candidate_id
+        for candidate_id, candidate_row in product_row_by_line.items()
+        if candidate_id == candidate_row["line_ids"][0]
+        and candidate_row["import_row"] != product_row["import_row"]
+        and candidate_row.get("article_id") is not None
+    ]
+    mode_key = f"pack_split_mode_{source.name}_{line_id}"
+    saved_mode = "Artículo de esta factura" if saved_split.get("component_line") else "Buscar en EFFI"
+    mode = st.radio(
+        "Destino del componente",
+        ("Artículo de esta factura", "Buscar en EFFI"),
+        index=0 if saved_mode == "Artículo de esta factura" else 1,
+        horizontal=True,
+        key=mode_key,
+    )
+    component_line = None
+    component_product: dict[str, Any] | None = None
+    if mode == "Artículo de esta factura":
+        if split_targets:
+            saved_target = str(saved_split.get("component_line") or "")
+            component_line = st.selectbox(
+                "Producto incluido en el pack",
+                [None] + split_targets,
+                index=(split_targets.index(saved_target) + 1) if saved_target in split_targets else 0,
+                format_func=lambda candidate_id: (
+                    "Seleccione un producto" if candidate_id is None else
+                    f"EFFI {product_row_by_line[candidate_id].get('article_id')} · "
+                    f"{product_row_by_line[candidate_id].get('description') or line_by_id[candidate_id].description}"
+                ),
+                key=f"pack_split_invoice_target_{source.name}_{line_id}",
+            )
+            if component_line:
+                component_product = {
+                    "IdProducto": product_row_by_line[component_line]["article_id"],
+                    "Nombre": product_row_by_line[component_line].get("description") or line_by_id[component_line].description,
+                }
+        else:
+            st.info("No hay otro producto EFFI asignado en esta factura; busca el artículo en EFFI.")
+    else:
+        search_key = f"pack_split_search_{source.name}_{line_id}"
+        results_key = f"pack_split_results_{source.name}_{line_id}"
+        query = st.text_input("Buscar producto EFFI", key=search_key)
+        if st.button("Buscar en EFFI", key=f"pack_split_search_button_{source.name}_{line_id}"):
+            try:
+                st.session_state[results_key] = search_products(query, limit=80) if query.strip() else []
+            except Exception as error:
+                st.session_state[results_key] = []
+                st.error(f"No se pudo consultar el catálogo EFFI: {error}")
+        catalog_products = list(st.session_state.get(results_key, []))
+        saved_product_id = saved_split.get("component_product_id")
+        if saved_product_id is not None and not any(
+            str(product.get("IdProducto")) == str(saved_product_id) for product in catalog_products
+        ):
+            catalog_products.insert(0, {
+                "IdProducto": saved_product_id,
+                "Nombre": saved_split.get("component_product_name") or "Producto guardado",
+            })
+        if catalog_products:
+            catalog_ids = [product.get("IdProducto") for product in catalog_products]
+            saved_index = next((
+                index for index, product_id in enumerate(catalog_ids)
+                if str(product_id) == str(saved_product_id)
+            ), -1)
+            selected_product_id = st.selectbox(
+                "Artículo componente",
+                [None] + catalog_ids,
+                index=saved_index + 1 if saved_index >= 0 else 0,
+                format_func=lambda product_id: (
+                    "Seleccione un producto" if product_id is None else next(
+                        _product_label(product) for product in catalog_products
+                        if str(product.get("IdProducto")) == str(product_id)
+                    )
+                ),
+                key=f"pack_split_catalog_target_{source.name}_{line_id}",
+            )
+            component_product = next((
+                product for product in catalog_products
+                if str(product.get("IdProducto")) == str(selected_product_id)
+            ), None)
+    component_product_id = component_product.get("IdProducto") if component_product else None
+    component_product_name = str(component_product.get("Nombre") or "") if component_product else ""
+    split_active = component_product_id is not None
+    pack_quantity = Decimal(str(line.quantity))
+    default_units = float(saved_split.get("units_per_pack", "1"))
+    default_component_cost = float(saved_split.get(
+        "component_unit_cost",
+        (line.net_amount / pack_quantity / Decimal("2")) if pack_quantity else Decimal("0"),
+    ))
+    split_columns = st.columns(2)
+    with split_columns[0]:
+        units_per_pack = st.number_input(
+            "Unidades del producto incluido por pack",
+            min_value=0.01,
+            value=max(default_units, 0.01),
+            step=1.0,
+            key=f"pack_split_units_{source.name}_{line_id}",
+            disabled=not split_active,
+        )
+    with split_columns[1]:
+        component_unit_cost = st.number_input(
+            "Costo asignado por unidad incluida (COP)",
+            min_value=0.0,
+            value=max(default_component_cost, 0.0),
+            step=0.01,
+            format="%.2f",
+            key=f"pack_split_cost_{source.name}_{line_id}",
+            disabled=not split_active,
+        )
+    component_quantity = pack_quantity * Decimal(str(units_per_pack))
+    allocated_cost = component_quantity * Decimal(str(component_unit_cost))
+    st.caption(
+        f"Se asignarán {_quantity(component_quantity)} unidades y {_money(allocated_cost)} "
+        "al producto vinculado; ese valor se resta del costo del producto principal."
+    )
+    source_article_id = product_row.get("article_id")
+    if split_active and source_article_id is None:
+        st.warning("Asigna primero un artículo EFFI al producto principal para completar el desglose.")
+    if st.button(
+        "Guardar desglose del pack",
+        key=f"save_pack_split_{source.name}_{line_id}",
+        disabled=split_active and (
+            component_quantity <= 0
+            or allocated_cost > line.net_amount
+            or source_article_id is None
+            or str(component_product_id) == str(source_article_id)
+        ),
+    ):
+        _record_pack_split(
+            review_state,
+            source,
+            line_id,
+            component_line,
+            component_product_id,
+            component_product_name,
+            Decimal(str(units_per_pack)),
+            Decimal(str(component_unit_cost)),
+            reviewer_name,
+        )
+        st.success("Desglose del pack guardado.")
+        st.rerun()
+
 
 def _invoice_product_rows(
     queue_item: dict[str, Any], invoice_reviews: dict[str, Any] | None = None
@@ -1080,7 +1270,11 @@ def _invoice_product_rows(
             "description": " / ".join(dict.fromkeys(line.description for line in lines if line.description)),
             "barcode": next((line.barcode for line in lines if line.barcode), ""),
             "item_code": next((line.item_code for line in lines if line.item_code), ""),
-            "article_id": data.get("article_id"),
+            "article_id": next((
+                invoice_reviews.get(line_id, {}).get("product_id")
+                for line_id in line_ids
+                if invoice_reviews.get(line_id, {}).get("product_id") is not None
+            ), data.get("article_id")),
             "quantity": total_quantity,
             "net_total": net_total,
             "effective_cost": effective_cost,
@@ -1417,6 +1611,54 @@ def _draft_invoice_reviews(
         )
         is_bonus = bool(session_state.get(f"is_bonus_{source_name}_{line_id}", default_bonus))
         review = {**saved_review, "is_bonus": is_bonus}
+        saved_split = saved_review.get("pack_split") or {}
+        split_mode = session_state.get(
+            f"pack_split_mode_{source_name}_{line_id}",
+            "Artículo de esta factura" if saved_split.get("component_line") else "Buscar en EFFI",
+        )
+        split_target = None
+        split_product_id = None
+        split_product_name = ""
+        if split_mode == "Artículo de esta factura":
+            split_target = session_state.get(
+                f"pack_split_invoice_target_{source_name}_{line_id}",
+                saved_split.get("component_line"),
+            )
+            if split_target:
+                split_product_id = (
+                    draft_reviews.get(str(split_target), {}).get("product_id")
+                    or queue_item.get("article_ids", {}).get(str(split_target))
+                )
+                split_product_name = line_by_id[str(split_target)].description
+        else:
+            split_product_id = session_state.get(
+                f"pack_split_catalog_target_{source_name}_{line_id}",
+                saved_split.get("component_product_id"),
+            )
+            catalog_results = session_state.get(f"pack_split_results_{source_name}_{line_id}", [])
+            split_product_name = next((
+                str(product.get("Nombre") or "")
+                for product in catalog_results
+                if str(product.get("IdProducto")) == str(split_product_id)
+            ), str(saved_split.get("component_product_name") or ""))
+        if split_product_id is not None:
+            split_units = session_state.get(
+                f"pack_split_units_{source_name}_{line_id}",
+                saved_split.get("units_per_pack", "1"),
+            )
+            split_cost = session_state.get(
+                f"pack_split_cost_{source_name}_{line_id}",
+                saved_split.get("component_unit_cost", "0"),
+            )
+            review["pack_split"] = {
+                "component_line": split_target,
+                "component_product_id": split_product_id,
+                "component_product_name": split_product_name,
+                "units_per_pack": str(split_units),
+                "component_unit_cost": str(split_cost),
+            }
+        else:
+            review.pop("pack_split", None)
         if not is_bonus:
             review["bonus_link_line"] = None
             draft_reviews[line_id] = review
@@ -1593,6 +1835,93 @@ def _reviewed_workbook(
         sheet.cell(row=row, column=6, value=total_quantity)
         sheet.cell(row=row, column=7, value=unit_cost)
         sheet.cell(row=row, column=8, value=Decimal("0"))
+
+    split_net_by_row: dict[int, Decimal] = {}
+    split_quantity_by_row: dict[int, Decimal] = {}
+    created_component_rows: dict[str, int] = {}
+    next_component_row = max(max(line_rows.values(), default=1), sheet.max_row) + 1
+    for line_id, review in approved.items():
+        split = review.get("pack_split")
+        if not split:
+            continue
+        source_line = line_by_id.get(str(line_id))
+        component_line_id = str(split.get("component_line") or "")
+        target_line = line_by_id.get(component_line_id)
+        source_row = line_rows.get(str(line_id))
+        if source_line is None or source_row is None or source_line.net_amount <= 0 or review.get("is_bonus"):
+            raise ValueError(f"El desglose de la línea {line_id} requiere dos productos válidos y distintos.")
+        if component_line_id and target_line is None:
+            raise ValueError(f"El producto vinculado al desglose de la línea {line_id} ya no existe en la factura.")
+        source_product_id = _verified_article_id(
+            review.get("product_id") or queue_item.get("article_ids", {}).get(str(line_id)),
+            source_line,
+        )
+        target_product_id = _verified_article_id(split.get("component_product_id"))
+        if target_product_id is None and target_line is not None:
+            target_product_id = _verified_article_id(
+                approved.get(component_line_id, {}).get("product_id")
+                or queue_item.get("article_ids", {}).get(component_line_id),
+                target_line,
+            )
+        if source_product_id is None or target_product_id is None or source_product_id == target_product_id:
+            raise ValueError(f"El desglose de la línea {line_id} requiere artículos EFFI diferentes asignados.")
+        target_row = line_rows.get(component_line_id) if component_line_id else None
+        if target_row is None:
+            target_row = next((
+                row
+                for row, candidate_line_ids in line_ids_by_row.items()
+                if any(
+                    str(_verified_article_id(
+                        approved.get(candidate_id, {}).get("product_id")
+                        or queue_item.get("article_ids", {}).get(candidate_id)
+                        or sheet.cell(row=row, column=1).value
+                    )) == str(target_product_id)
+                    for candidate_id in candidate_line_ids
+                )
+            ), None)
+        if target_row is None:
+            target_row = created_component_rows.get(str(target_product_id))
+        if target_row is None:
+            target_row = next_component_row
+            next_component_row += 1
+            created_component_rows[str(target_product_id)] = target_row
+            for column in range(1, 10):
+                template_cell = sheet.cell(row=2, column=column)
+                new_cell = sheet.cell(row=target_row, column=column)
+                new_cell._style = template_cell._style
+                if template_cell.number_format:
+                    new_cell.number_format = template_cell.number_format
+            sheet.cell(row=target_row, column=1, value=target_product_id)
+            sheet.cell(row=target_row, column=2, value=1)
+            sheet.cell(row=target_row, column=6, value=Decimal("0"))
+            sheet.cell(row=target_row, column=7, value=Decimal("0"))
+            sheet.cell(row=target_row, column=8, value=Decimal("0"))
+            sheet.cell(row=target_row, column=9, value=sheet.cell(row=source_row, column=9).value)
+        if source_row == target_row:
+            raise ValueError(f"El desglose de la línea {line_id} apunta al mismo producto principal.")
+        units_per_pack = Decimal(str(split.get("units_per_pack", "0")))
+        component_unit_cost = Decimal(str(split.get("component_unit_cost", "0")))
+        if units_per_pack <= 0 or component_unit_cost < 0:
+            raise ValueError(f"Las unidades o el costo del desglose de la línea {line_id} no son válidos.")
+        component_quantity = source_line.quantity * units_per_pack
+        allocated_cost = component_quantity * component_unit_cost
+        if allocated_cost > source_line.net_amount:
+            raise ValueError(f"El costo asignado al producto incluido supera el neto de la línea {line_id}.")
+        split_net_by_row[source_row] = split_net_by_row.get(source_row, Decimal("0")) - allocated_cost
+        split_net_by_row[target_row] = split_net_by_row.get(target_row, Decimal("0")) + allocated_cost
+        split_quantity_by_row[target_row] = split_quantity_by_row.get(target_row, Decimal("0")) + component_quantity
+
+    for row in set(split_net_by_row) | set(split_quantity_by_row):
+        base_quantity = Decimal(str(sheet.cell(row=row, column=6).value or 0))
+        base_price = Decimal(str(sheet.cell(row=row, column=7).value or 0))
+        base_discount = Decimal(str(sheet.cell(row=row, column=8).value or 0))
+        quantity = base_quantity + split_quantity_by_row.get(row, Decimal("0"))
+        net_total = base_quantity * base_price - base_discount + split_net_by_row.get(row, Decimal("0"))
+        if quantity <= 0 or net_total < 0:
+            raise ValueError("El desglose del pack produce cantidades o costos no válidos.")
+        sheet.cell(row=row, column=6, value=quantity)
+        sheet.cell(row=row, column=7, value=net_total / quantity)
+        sheet.cell(row=row, column=8, value=Decimal("0"))
     destination = original.with_name(original.stem.removesuffix("_effi") + "_revisado.xlsx")
     workbook.save(destination)
     workbook.close()
@@ -1624,9 +1953,27 @@ def _render_product(product: dict[str, Any] | None, confidence: Any = None) -> N
 def _render_styles() -> None:
     st.markdown("""
     <style>
-            :root { --ink: #202b27; --paper: #f4f6f4; --line: #dce3df; --green: #1c5b4b; --muted: #697570; }
+            :root {
+                color-scheme: light dark;
+                --ink: #202b27;
+                --paper: #f4f6f4;
+                --surface: #fff;
+                --line: #dce3df;
+                --green: #1c5b4b;
+                --muted: #697570;
+            }
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --ink: #e5ede8;
+                    --paper: #111916;
+                    --surface: #19231e;
+                    --line: #35443c;
+                    --green: #85b8a0;
+                    --muted: #acbab3;
+                }
+            }
             .stApp { background: var(--paper); color: var(--ink); }
-            [data-testid="stHeader"] { background: #fff; border-bottom: 1px solid var(--line); }
+            [data-testid="stHeader"] { background: var(--surface); border-bottom: 1px solid var(--line); color: var(--ink); }
             [data-testid="stSidebar"] { background: #183b32; }
             [data-testid="stSidebar"] * { color: #f4f7f5; }
             [data-testid="stSidebar"] input { background: #214b40; border-color: rgba(244,247,245,.25); }
@@ -1634,7 +1981,7 @@ def _render_styles() -> None:
             [data-testid="stSidebar"] [data-testid="stRadio"] label p { color: #f4f7f5 !important; line-height: 1.3; overflow-wrap: anywhere; white-space: normal !important; }
             [data-testid="stMetricValue"] { font-size: 1.08rem; overflow-wrap: anywhere; white-space: normal; }
             .block-container { max-width: 1240px; padding-top: .2rem; padding-bottom: 2rem; }
-            .app-topbar { height: 3rem; display: grid; grid-template-columns: 1fr 1fr 1fr; align-items: center; border-bottom: 1px solid var(--line); margin: 0 -1rem 1.15rem; padding: 0 1rem; background: #fff; }
+            .app-topbar { height: 3rem; display: grid; grid-template-columns: 1fr 1fr 1fr; align-items: center; border-bottom: 1px solid var(--line); margin: 0 -1rem 1.15rem; padding: 0 1rem; background: var(--surface); }
             .app-topbar-title { text-align: center; font-weight: 600; font-size: .92rem; }
             .app-topbar-user { justify-self: end; width: 2rem; height: 2rem; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; color: var(--green); font-weight: 700; }
             .sidebar-brand, .sidebar-profile { display: flex; align-items: center; gap: .7rem; padding: .6rem .2rem 1rem; }
@@ -1645,13 +1992,13 @@ def _render_styles() -> None:
             .sidebar-status small, .sidebar-status span { color: #b9cec5; font-size: .72rem; }
             .sidebar-status strong { color: #e8f2ed; font-size: .84rem; }
             .sidebar-profile { margin-top: .8rem; border-top: 1px solid rgba(244,247,245,.2); padding-top: 1rem; }
-            .page-eyebrow { color: #437e69; font-size: .69rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: .45rem 0 .25rem; }
+            .page-eyebrow { color: var(--green); font-size: .69rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: .45rem 0 .25rem; }
             h1, h2, h3 { color: var(--ink); font-family: "DM Sans", "Segoe UI", sans-serif; letter-spacing: 0; }
             h1 { font-size: 1.65rem; line-height: 1.2; margin: 0 0 .3rem; }
             h2 { font-size: 1.12rem; }
             h3, h4 { font-size: 1rem; }
             .page-subtitle { color: var(--muted); font-size: .92rem; margin: 0 0 1rem; }
-            .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: #fff; border: 1px solid var(--line); border-radius: 6px; margin: .5rem 0 1.4rem; }
+            .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; margin: .5rem 0 1.4rem; }
             .summary-card { min-height: 6.3rem; padding: 1rem .85rem .8rem; }
             .summary-card + .summary-card { border-left: 1px solid var(--line); }
             .summary-label { color: var(--muted); font-size: .78rem; margin-bottom: .25rem; }
@@ -2155,6 +2502,32 @@ def main() -> None:
                             product_row_by_line,
                             reviewer_name,
                         )
+
+        split_source_line_ids = [
+            str(line.line_id)
+            for line in invoice.lines
+            if line.net_amount > 0
+            and product_row_by_line[str(line.line_id)].get("article_id") is not None
+        ]
+        if split_source_line_ids:
+            with st.expander("Desglosar packs en productos de esta factura", expanded=False):
+                selected_split_line = st.selectbox(
+                    "Producto o pack para dividir",
+                    split_source_line_ids,
+                    format_func=lambda selected_id: (
+                        f"Línea {selected_id} · {line_by_id[selected_id].description or line_by_id[selected_id].item_code}"
+                    ),
+                    key=f"pack_split_source_{source.name}",
+                )
+                _render_pack_split_editor(
+                    source,
+                    line_by_id[selected_split_line],
+                    invoice_reviews,
+                    review_state,
+                    line_by_id,
+                    product_row_by_line,
+                    reviewer_name,
+                )
 
         automatic_match_rows = _automatic_match_table_rows(queue_item)
         if automatic_match_rows:
