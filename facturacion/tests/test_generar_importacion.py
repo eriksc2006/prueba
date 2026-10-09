@@ -60,6 +60,14 @@ class InvoiceParsingTests(unittest.TestCase):
             Decimal("5600.00"),
         )
 
+    def test_display_formats_quantities_as_integers_and_costs_to_two_decimals(self) -> None:
+        from facturacion.revisar_excepciones import _money, _quantity
+
+        self.assertEqual(_quantity(Decimal("12.00")), "12")
+        self.assertEqual(_quantity(Decimal("1234.6")), "1.235")
+        self.assertEqual(_money(Decimal("1234.5678")), "COP $ 1.234,57")
+        self.assertEqual(_money(Decimal("12")), "COP $ 12,00")
+
     def test_connection_string_includes_credentials_for_active_directory_password(self) -> None:
         from facturacion.azure_codes import _connection_string
 
