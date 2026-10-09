@@ -97,20 +97,14 @@ def _money(value: Any) -> str:
     if value is None or str(value).strip().lower() in {"", "none"}:
         return "Sin dato"
     try:
-        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        formatted = f"{amount:,.2f}"
+        amount = Decimal(str(value))
+        precision = max(2, -amount.as_tuple().exponent)
+        formatted = f"{amount:,.{precision}f}"
+        whole, _, fractional = formatted.partition(".")
+        fractional = fractional.rstrip("0").ljust(2, "0")
+        formatted = f"{whole}.{fractional}"
         localized = formatted.replace(",", "_").replace(".", ",").replace("_", ".")
         return f"COP $ {localized}"
-    except Exception:
-        return str(value)
-
-
-def _quantity(value: Any) -> str:
-    if value is None or str(value).strip().lower() in {"", "none"}:
-        return "Sin dato"
-    try:
-        amount = Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-        return f"{amount:,.0f}".replace(",", ".")
     except Exception:
         return str(value)
 
@@ -975,7 +969,7 @@ def _render_cost_editor(
                 min_value=0.0,
                 value=float(output_cost),
                 step=0.01,
-                format="%.2f",
+                format="%.6f",
                 key=(f"bonus_cost_{source.name}_{line_id}_{bonus_link_line}" if is_bonus else f"regular_cost_{source.name}_{line_id}"),
                 disabled=is_bonus,
             )
@@ -1004,18 +998,15 @@ def _render_cost_editor(
             st.caption(f"Precio base {_money(final_cost)} · Impuesto(s): {tax_description}")
     with summary_column:
         if is_bonus and allocation:
-            st.metric("Unidades del grupo", _quantity(allocation["total_quantity"]))
-            st.caption(
-                f'{_quantity(allocation["billed_quantity"])} pagadas + '
-                f'{_quantity(allocation["bonus_quantity"])} gratis'
-            )
+            st.metric("Unidades del grupo", allocation["total_quantity"])
+            st.caption(f'{allocation["billed_quantity"]} pagadas + {allocation["bonus_quantity"]} gratis')
         else:
             st.metric("Neto de línea", _money(product_row["net_total"]))
 
     if is_bonus and allocation:
         calculated_net = (allocation["effective_unit_cost"] * allocation["total_quantity"]).quantize(Decimal("0.01"))
         st.caption(
-            f'Neto del grupo {_money(allocation["net_total"])} ÷ {_quantity(allocation["total_quantity"])} '
+            f'Neto del grupo {_money(allocation["net_total"])} ÷ {allocation["total_quantity"]} '
             f'und. = {_money(allocation["effective_unit_cost"])} / und.'
         )
         if abs(calculated_net - allocation["net_total"].quantize(Decimal("0.01"))) <= Decimal("0.02"):
@@ -1624,69 +1615,46 @@ def _render_product(product: dict[str, Any] | None, confidence: Any = None) -> N
 def _render_styles() -> None:
     st.markdown("""
     <style>
-            :root {
-                color-scheme: light;
-                --ink: #202b27; --paper: #f4f6f4; --line: #dce3df;
-                --green: #1c5b4b; --green-strong: #1c5b4b; --muted: #697570;
-                --surface: #fff; --sidebar: #183b32; --sidebar-text: #f4f7f5;
-                --sidebar-input: #214b40; --sidebar-muted: #b9cec5;
-                --sidebar-border: rgba(244,247,245,.22); --brand-bg: #dcebe4;
-                --brand-ink: #183b32; --eyebrow: #437e69; --summary-note: #7b8580;
-            }
-            @media (prefers-color-scheme: dark) {
-                :root {
-                    color-scheme: dark;
-                    --ink: #e5ede8; --paper: #111916; --line: #394840;
-                    --green: #83cba6; --green-strong: #176144; --muted: #aab7af;
-                    --surface: #19231e; --sidebar: #162a22; --sidebar-text: #e7efe9;
-                    --sidebar-input: #20382e; --sidebar-muted: #a7bbb0;
-                    --sidebar-border: rgba(231,239,233,.2); --brand-bg: #c9e4d5;
-                    --brand-ink: #15392b; --eyebrow: #8ac9a8; --summary-note: #a5b0aa;
-                }
-            }
+            :root { --ink: #202b27; --paper: #f4f6f4; --line: #dce3df; --green: #1c5b4b; --muted: #697570; }
             .stApp { background: var(--paper); color: var(--ink); }
-            [data-testid="stHeader"] { background: var(--surface); border-bottom: 1px solid var(--line); }
-            [data-testid="stSidebar"] { background: var(--sidebar); }
-            [data-testid="stSidebar"] * { color: var(--sidebar-text); }
-            [data-testid="stSidebar"] input { background: var(--sidebar-input); border-color: var(--sidebar-border); }
-            [data-testid="stSidebar"] [data-testid="stRadio"] label { align-items: flex-start; border-bottom: 1px solid var(--sidebar-border); padding: .62rem .25rem; }
-            [data-testid="stSidebar"] [data-testid="stRadio"] label p { color: var(--sidebar-text) !important; line-height: 1.3; overflow-wrap: anywhere; white-space: normal !important; }
-            [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
-            [data-testid="stTextArea"] textarea, [data-testid="stSelectbox"] [data-baseweb="select"] > div,
-            [data-testid="stDateInput"] input { background: var(--surface); color: var(--ink); border-color: var(--line); }
-            [data-testid="stCaptionContainer"], [data-testid="stMarkdownContainer"] { color: var(--ink); }
+            [data-testid="stHeader"] { background: #fff; border-bottom: 1px solid var(--line); }
+            [data-testid="stSidebar"] { background: #183b32; }
+            [data-testid="stSidebar"] * { color: #f4f7f5; }
+            [data-testid="stSidebar"] input { background: #214b40; border-color: rgba(244,247,245,.25); }
+            [data-testid="stSidebar"] [data-testid="stRadio"] label { align-items: flex-start; border-bottom: 1px solid rgba(244,247,245,.16); padding: .62rem .25rem; }
+            [data-testid="stSidebar"] [data-testid="stRadio"] label p { color: #f4f7f5 !important; line-height: 1.3; overflow-wrap: anywhere; white-space: normal !important; }
             [data-testid="stMetricValue"] { font-size: 1.08rem; overflow-wrap: anywhere; white-space: normal; }
             .block-container { max-width: 1240px; padding-top: .2rem; padding-bottom: 2rem; }
-            .app-topbar { height: 3rem; display: grid; grid-template-columns: 1fr 1fr 1fr; align-items: center; border-bottom: 1px solid var(--line); margin: 0 -1rem 1.15rem; padding: 0 1rem; background: var(--surface); }
+            .app-topbar { height: 3rem; display: grid; grid-template-columns: 1fr 1fr 1fr; align-items: center; border-bottom: 1px solid var(--line); margin: 0 -1rem 1.15rem; padding: 0 1rem; background: #fff; }
             .app-topbar-title { text-align: center; font-weight: 600; font-size: .92rem; }
             .app-topbar-user { justify-self: end; width: 2rem; height: 2rem; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; color: var(--green); font-weight: 700; }
             .sidebar-brand, .sidebar-profile { display: flex; align-items: center; gap: .7rem; padding: .6rem .2rem 1rem; }
-            .brand-mark, .profile-mark { width: 2.25rem; height: 2.25rem; display: grid; place-items: center; border-radius: 6px; background: var(--brand-bg); color: var(--brand-ink) !important; font-weight: 700; }
+            .brand-mark, .profile-mark { width: 2.25rem; height: 2.25rem; display: grid; place-items: center; border-radius: 6px; background: #dcebe4; color: #183b32 !important; font-weight: 700; }
             .sidebar-brand strong, .sidebar-brand small, .sidebar-profile strong, .sidebar-profile small { display: block; }
-            .sidebar-brand small, .sidebar-profile small { color: var(--sidebar-muted); font-size: .72rem; margin-top: .12rem; }
-            .sidebar-status { display: grid; gap: .24rem; margin: 1.1rem 0 .75rem; padding: .8rem; border: 1px solid var(--sidebar-border); border-radius: 5px; }
-            .sidebar-status small, .sidebar-status span { color: var(--sidebar-muted); font-size: .72rem; }
-            .sidebar-status strong { color: var(--sidebar-text); font-size: .84rem; }
-            .sidebar-profile { margin-top: .8rem; border-top: 1px solid var(--sidebar-border); padding-top: 1rem; }
-            .page-eyebrow { color: var(--eyebrow); font-size: .69rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: .45rem 0 .25rem; }
+            .sidebar-brand small, .sidebar-profile small { color: #b9cec5; font-size: .72rem; margin-top: .12rem; }
+            .sidebar-status { display: grid; gap: .24rem; margin: 1.1rem 0 .75rem; padding: .8rem; border: 1px solid rgba(244,247,245,.22); border-radius: 5px; }
+            .sidebar-status small, .sidebar-status span { color: #b9cec5; font-size: .72rem; }
+            .sidebar-status strong { color: #e8f2ed; font-size: .84rem; }
+            .sidebar-profile { margin-top: .8rem; border-top: 1px solid rgba(244,247,245,.2); padding-top: 1rem; }
+            .page-eyebrow { color: #437e69; font-size: .69rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: .45rem 0 .25rem; }
             h1, h2, h3 { color: var(--ink); font-family: "DM Sans", "Segoe UI", sans-serif; letter-spacing: 0; }
             h1 { font-size: 1.65rem; line-height: 1.2; margin: 0 0 .3rem; }
             h2 { font-size: 1.12rem; }
             h3, h4 { font-size: 1rem; }
             .page-subtitle { color: var(--muted); font-size: .92rem; margin: 0 0 1rem; }
-            .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; margin: .5rem 0 1.4rem; }
+            .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: #fff; border: 1px solid var(--line); border-radius: 6px; margin: .5rem 0 1.4rem; }
             .summary-card { min-height: 6.3rem; padding: 1rem .85rem .8rem; }
             .summary-card + .summary-card { border-left: 1px solid var(--line); }
             .summary-label { color: var(--muted); font-size: .78rem; margin-bottom: .25rem; }
             .summary-value { color: var(--ink); font-size: 1.75rem; font-weight: 650; line-height: 1.2; }
-            .summary-note { color: var(--summary-note); font-size: .72rem; margin-top: .55rem; }
+            .summary-note { color: #7b8580; font-size: .72rem; margin-top: .55rem; }
             .section-title { font-size: 1.18rem; font-weight: 650; margin: 1.25rem 0 .25rem; }
             .compare-panel { border-top: 3px solid var(--green); padding: .45rem 0 .15rem; min-height: 0; }
             .compare-panel.xml { border-color: #c45135; }
             div.stButton > button { min-height: 2.55rem; border-radius: 5px; border-color: var(--line); }
-            div.stButton > button[kind="primary"] { background: var(--green-strong); border-color: var(--green-strong); color: #fff; }
+            div.stButton > button[kind="primary"] { background: var(--green); border-color: var(--green); color: #fff; }
             [data-testid="stMetric"] { background: transparent; border-bottom: 1px solid var(--line); padding: .2rem 0; }
-            div[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
+            div[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 5px; }
             @media (max-width: 900px) {
                 .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
                 .summary-card:nth-child(3) { border-left: 0; border-top: 1px solid var(--line); }
@@ -2122,7 +2090,7 @@ def main() -> None:
                 "Línea": ", ".join(line_ids),
                 "Producto": str(product_row.get("description") or ""),
                 "Código": str(product_row.get("barcode") or ""),
-                "Cantidad": _quantity(product_row.get("quantity")),
+                "Cantidad": str(product_row.get("quantity")),
                 "Neto": _money(product_row.get("net_total")),
                 "Costo": _money(product_row.get("effective_cost")),
                 "Bonificación": "Sí" if product_row.get("bonus") else "No",
@@ -2294,15 +2262,14 @@ def main() -> None:
                     st.error(
                         f"Código de barras {line.barcode} no registrado en EFFI para el producto "
                         f"'{html.escape(line.description or 'sin descripción')}'. "
-                        # Habilitado temporalmente: la asociación manual puede buscar por descripción.
-                        "Vincula este GTIN al producto en EFFI; la asignación automática no buscará por descripción."
+                        "Vincula este código al producto en EFFI; no se buscará por descripción."
                     )
             invoice_presentation = item.get("Presentación factura")
             if invoice_presentation is None or str(invoice_presentation).strip().lower() == "none":
                 invoice_presentation = ", ".join(sorted(_presentation_tokens(description or "")))
             st.caption(f"Presentación detectada: {_format_presentation(invoice_presentation)}")
             amount_columns = st.columns(3)
-            amount_columns[0].metric("Cantidad", _quantity(line.quantity if line else item.get("Cantidad")))
+            amount_columns[0].metric("Cantidad", _display(line.quantity if line else item.get("Cantidad")))
             amount_columns[1].metric("Precio unitario", _money(line.unit_price if line else item.get("Precio unitario XML")))
             amount_columns[2].metric("Descuento", _money(line.discount_total if line else item.get("Descuento XML")))
             st.metric("Neto declarado en factura", _money(line.net_amount if line else item.get("Neto XML")))
@@ -2310,7 +2277,7 @@ def main() -> None:
                 st.info("Bonificación del 100% detectada automáticamente; confirma a qué producto pagado pertenece.")
             if item.get("Bonificación consolidada"):
                 st.info(
-                    f"Bonificación consolidada: {_quantity(item.get('Unidades totales del producto'))} unidades "
+                    f"Bonificación consolidada: {item.get('Unidades totales del producto')} unidades "
                     f"de las líneas {item.get('Líneas XML consolidadas')}. "
                     f"Costo efectivo: {_money(item.get('Costo unitario efectivo'))} por unidad; "
                     f"neto agrupado: {_money(item.get('Neto agrupado'))}."
@@ -2347,54 +2314,13 @@ def main() -> None:
             else "Editar manualmente · buscar en EFFI",
             expanded=False,
         ):
-            # Habilitado temporalmente: búsqueda manual del catálogo EFFI.
-            st.info("Busca un artículo en el catálogo EFFI y confirma el resultado para asociarlo a esta línea.")
-            manual_query_key = f"manual_query_{review_key}"
-            manual_results_key = f"manual_results_{review_key}"
-            manual_query = st.text_input(
-                "GTIN exacto o descripción" if line and line.barcode else "Descripción de referencia",
+            st.info("La búsqueda manual queda bloqueada temporalmente. El producto se revisará con el botón disponible en esta pantalla.")
+            st.text_input(
+                "Texto de referencia" if line and line.barcode else "Descripción de referencia",
                 value=line.barcode if line and line.barcode else str(item.get("Descripción factura") or ""),
-                key=manual_query_key,
+                key=f"blocked_query_{review_key}",
+                disabled=True,
             )
-            # Habilitado temporalmente: ejecuta la búsqueda exacta por GTIN o por texto.
-            if st.button("Buscar en EFFI", key=f"manual_search_{review_key}"):
-                if manual_query.strip():
-                    try:
-                        st.session_state[manual_results_key] = _search_products_for_review(
-                            line.barcode if line else None, manual_query
-                        )
-                    except Exception as error:
-                        st.session_state[manual_results_key] = []
-                        st.error(f"No se pudo buscar en EFFI: {error}")
-                else:
-                    st.session_state[manual_results_key] = []
-                    st.warning("Escribe un GTIN o una descripción para buscar.")
-            manual_results = st.session_state.get(manual_results_key)
-            # Habilitado temporalmente: permite revisar resultados y asociar un producto seleccionado.
-            if manual_results is not None:
-                if manual_results:
-                    selected_manual_index = st.selectbox(
-                        "Resultados de EFFI",
-                        range(len(manual_results)),
-                        format_func=lambda index: _product_label(manual_results[index]),
-                        key=f"manual_result_selection_{review_key}",
-                    )
-                    if st.button(
-                        "Asociar producto seleccionado",
-                        type="primary",
-                        key=f"manual_confirm_{review_key}",
-                    ):
-                        _record_review(
-                            review_state,
-                            source,
-                            line_id,
-                            "confirmed",
-                            manual_results[selected_manual_index],
-                            reviewer_name,
-                        )
-                        st.rerun()
-                else:
-                    st.info("No se encontraron productos en EFFI para esa búsqueda.")
             if review.get("status") in {"confirmed", "no_match", "reviewed"}:
                 if st.button("Reabrir esta línea", key=f"reopen_{review_key}"):
                     _record_review(review_state, source, line_id, "pending", reviewed_by=reviewer_name)
@@ -2471,7 +2397,7 @@ def main() -> None:
                 automatic_match_by_line[line_id].get("barcode") or ""
                 for line_id in line_ids if line_id in automatic_match_by_line
             ), "")),
-            "Cantidad": _quantity(product_row.get("quantity")),
+            "Cantidad": str(product_row.get("quantity")),
             "Neto": _money(product_row.get("net_total")),
             "Costo unitario": _money(product_row.get("effective_cost")),
             "Asignado": str(decision.get("Artículo") or product_row.get("article_id") or ""),

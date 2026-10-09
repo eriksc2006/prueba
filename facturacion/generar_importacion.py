@@ -770,8 +770,8 @@ def generate_workbook(
                 reasons.append("Cantidad no positiva")
             if grouped_bonus:
                 reasons.append(
-                    f"Bonificación/prorrateo: {group_quantity:.0f} unidades totales; "
-                    f"costo unitario efectivo {group_price:.2f}"
+                    f"Bonificación/prorrateo: {group_quantity} unidades totales; "
+                    f"costo unitario efectivo {group_price}"
                 )
             if full_discount_bonus:
                 reasons.append("Bonificación 100% detectada; vincular al producto facturado correspondiente")
