@@ -97,14 +97,20 @@ def _money(value: Any) -> str:
     if value is None or str(value).strip().lower() in {"", "none"}:
         return "Sin dato"
     try:
-        amount = Decimal(str(value))
-        precision = max(2, -amount.as_tuple().exponent)
-        formatted = f"{amount:,.{precision}f}"
-        whole, _, fractional = formatted.partition(".")
-        fractional = fractional.rstrip("0").ljust(2, "0")
-        formatted = f"{whole}.{fractional}"
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        formatted = f"{amount:,.2f}"
         localized = formatted.replace(",", "_").replace(".", ",").replace("_", ".")
         return f"COP $ {localized}"
+    except Exception:
+        return str(value)
+
+
+def _quantity(value: Any) -> str:
+    if value is None or str(value).strip().lower() in {"", "none"}:
+        return "Sin dato"
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return f"{amount:,.0f}".replace(",", ".")
     except Exception:
         return str(value)
 
@@ -969,7 +975,7 @@ def _render_cost_editor(
                 min_value=0.0,
                 value=float(output_cost),
                 step=0.01,
-                format="%.6f",
+                format="%.2f",
                 key=(f"bonus_cost_{source.name}_{line_id}_{bonus_link_line}" if is_bonus else f"regular_cost_{source.name}_{line_id}"),
                 disabled=is_bonus,
             )
@@ -998,15 +1004,18 @@ def _render_cost_editor(
             st.caption(f"Precio base {_money(final_cost)} · Impuesto(s): {tax_description}")
     with summary_column:
         if is_bonus and allocation:
-            st.metric("Unidades del grupo", allocation["total_quantity"])
-            st.caption(f'{allocation["billed_quantity"]} pagadas + {allocation["bonus_quantity"]} gratis')
+            st.metric("Unidades del grupo", _quantity(allocation["total_quantity"]))
+            st.caption(
+                f'{_quantity(allocation["billed_quantity"])} pagadas + '
+                f'{_quantity(allocation["bonus_quantity"])} gratis'
+            )
         else:
             st.metric("Neto de línea", _money(product_row["net_total"]))
 
     if is_bonus and allocation:
         calculated_net = (allocation["effective_unit_cost"] * allocation["total_quantity"]).quantize(Decimal("0.01"))
         st.caption(
-            f'Neto del grupo {_money(allocation["net_total"])} ÷ {allocation["total_quantity"]} '
+            f'Neto del grupo {_money(allocation["net_total"])} ÷ {_quantity(allocation["total_quantity"])} '
             f'und. = {_money(allocation["effective_unit_cost"])} / und.'
         )
         if abs(calculated_net - allocation["net_total"].quantize(Decimal("0.01"))) <= Decimal("0.02"):
@@ -2090,7 +2099,7 @@ def main() -> None:
                 "Línea": ", ".join(line_ids),
                 "Producto": str(product_row.get("description") or ""),
                 "Código": str(product_row.get("barcode") or ""),
-                "Cantidad": str(product_row.get("quantity")),
+                "Cantidad": _quantity(product_row.get("quantity")),
                 "Neto": _money(product_row.get("net_total")),
                 "Costo": _money(product_row.get("effective_cost")),
                 "Bonificación": "Sí" if product_row.get("bonus") else "No",
@@ -2269,7 +2278,7 @@ def main() -> None:
                 invoice_presentation = ", ".join(sorted(_presentation_tokens(description or "")))
             st.caption(f"Presentación detectada: {_format_presentation(invoice_presentation)}")
             amount_columns = st.columns(3)
-            amount_columns[0].metric("Cantidad", _display(line.quantity if line else item.get("Cantidad")))
+            amount_columns[0].metric("Cantidad", _quantity(line.quantity if line else item.get("Cantidad")))
             amount_columns[1].metric("Precio unitario", _money(line.unit_price if line else item.get("Precio unitario XML")))
             amount_columns[2].metric("Descuento", _money(line.discount_total if line else item.get("Descuento XML")))
             st.metric("Neto declarado en factura", _money(line.net_amount if line else item.get("Neto XML")))
@@ -2277,7 +2286,7 @@ def main() -> None:
                 st.info("Bonificación del 100% detectada automáticamente; confirma a qué producto pagado pertenece.")
             if item.get("Bonificación consolidada"):
                 st.info(
-                    f"Bonificación consolidada: {item.get('Unidades totales del producto')} unidades "
+                    f"Bonificación consolidada: {_quantity(item.get('Unidades totales del producto'))} unidades "
                     f"de las líneas {item.get('Líneas XML consolidadas')}. "
                     f"Costo efectivo: {_money(item.get('Costo unitario efectivo'))} por unidad; "
                     f"neto agrupado: {_money(item.get('Neto agrupado'))}."
@@ -2397,7 +2406,7 @@ def main() -> None:
                 automatic_match_by_line[line_id].get("barcode") or ""
                 for line_id in line_ids if line_id in automatic_match_by_line
             ), "")),
-            "Cantidad": str(product_row.get("quantity")),
+            "Cantidad": _quantity(product_row.get("quantity")),
             "Neto": _money(product_row.get("net_total")),
             "Costo unitario": _money(product_row.get("effective_cost")),
             "Asignado": str(decision.get("Artículo") or product_row.get("article_id") or ""),
