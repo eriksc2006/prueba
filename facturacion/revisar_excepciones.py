@@ -2696,13 +2696,55 @@ def main() -> None:
             else "Editar manualmente · buscar en EFFI",
             expanded=False,
         ):
-            st.info("La búsqueda manual queda bloqueada temporalmente. El producto se revisará con el botón disponible en esta pantalla.")
-            st.text_input(
+            # Habilitado temporalmente: búsqueda manual de productos EFFI.
+            query_key = f"manual_query_{review_key}"
+            results_key = f"manual_results_{review_key}"
+            initial_query = line.barcode if line and line.barcode else str(item.get("Descripción factura") or "")
+            query = st.text_input(
                 "Texto de referencia" if line and line.barcode else "Descripción de referencia",
-                value=line.barcode if line and line.barcode else str(item.get("Descripción factura") or ""),
-                key=f"blocked_query_{review_key}",
-                disabled=True,
+                value=initial_query,
+                key=query_key,
             )
+            if st.button("Buscar en EFFI", key=f"manual_search_{review_key}"):
+                try:
+                    st.session_state[results_key] = _search_products_for_review(
+                        line.barcode if line else item.get("Código de barras"), query
+                    ) if query.strip() else []
+                except Exception as error:
+                    st.session_state[results_key] = []
+                    st.error(f"No se pudo consultar el catálogo EFFI: {error}")
+
+            search_results = list(st.session_state.get(results_key, []))
+            if search_results:
+                result_ids = [product.get("IdProducto") for product in search_results]
+                selected_product_id = st.selectbox(
+                    "Producto encontrado",
+                    [None] + result_ids,
+                    format_func=lambda product_id: (
+                        "Seleccione un producto" if product_id is None else next(
+                            _product_label(product) for product in search_results
+                            if str(product.get("IdProducto")) == str(product_id)
+                        )
+                    ),
+                    key=f"manual_result_{review_key}",
+                )
+                selected_product = next((
+                    product for product in search_results
+                    if str(product.get("IdProducto")) == str(selected_product_id)
+                ), None)
+                if st.button(
+                    "Asignar producto EFFI",
+                    type="primary",
+                    disabled=selected_product is None,
+                    key=f"manual_assign_{review_key}",
+                ):
+                    _record_review(
+                        review_state, source, line_id, "confirmed", selected_product, reviewer_name
+                    )
+                    st.rerun()
+            elif results_key in st.session_state:
+                st.info("No se encontraron productos para esa búsqueda.")
+
             if review.get("status") in {"confirmed", "no_match", "reviewed"}:
                 if st.button("Reabrir esta línea", key=f"reopen_{review_key}"):
                     _record_review(review_state, source, line_id, "pending", reviewed_by=reviewer_name)

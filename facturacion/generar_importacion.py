@@ -619,6 +619,13 @@ def _line_warnings(
     return warnings
 
 
+def _append_literal_row(sheet: Worksheet, values: Iterable[Any]) -> None:
+    sheet.append(list(values))
+    for cell in sheet[sheet.max_row]:
+        if isinstance(cell.value, str):
+            cell.data_type = "s"
+
+
 def _write_detail(
     sheet: Worksheet,
     invoice: Invoice,
@@ -780,7 +787,7 @@ def generate_workbook(
             exceptions.append((line, candidate, score, margin, resolved, source_delta, import_discount, "; ".join(reasons)))
     if exceptions:
         exception_sheet = workbook.create_sheet("Excepciones")
-        exception_sheet.append([
+        _append_literal_row(exception_sheet, [
             "Línea", "Tipo", "Código de barras", "Descripción factura", "Cantidad",
             "Presentación factura", "Precio unitario XML", "Descuento XML", "Neto XML", "Neto calculado XML",
             "Ajuste aplicado al descuento", "IdProducto candidato", "Nombre candidato",
@@ -794,7 +801,7 @@ def generate_workbook(
             nearest = candidate or {}
             source_group = group_by_line[line.line_id]
             group_quantity, group_price, _, _ = _import_group_amounts(source_group)
-            exception_sheet.append([
+            _append_literal_row(exception_sheet, [
                 line.line_id,
                 reason,
                 line.barcode,
@@ -828,13 +835,13 @@ def generate_workbook(
             ])
     if automatic_matches:
         match_sheet = workbook.create_sheet("Coincidencias automáticas")
-        match_sheet.append([
+        _append_literal_row(match_sheet, [
             "Línea XML", "Descripción factura", "IdProducto EFFI", "Producto EFFI",
             "Código de barras EFFI", "Referencia EFFI", "Marca EFFI", "Categoría EFFI",
             "Puntaje", "Margen",
         ])
         for line, candidate, score, margin in automatic_matches:
-            match_sheet.append([
+            _append_literal_row(match_sheet, [
                 line.line_id,
                 line.description,
                 candidate.get("IdProducto"),

@@ -359,6 +359,61 @@ class InvoiceParsingTests(unittest.TestCase):
 
 
 class WorkbookGenerationTests(unittest.TestCase):
+    def test_untrusted_text_is_saved_as_literal_in_exception_and_match_sheets(self) -> None:
+        from facturacion.generar_importacion import Invoice, InvoiceLine
+
+        line = InvoiceLine(
+            line_id="1",
+            item_code="",
+            barcode="",
+            description="=1+1",
+            quantity=Decimal("-1"),
+            unit="UND",
+            unit_price=Decimal("10"),
+            discount_total=Decimal("0"),
+            net_amount=Decimal("-10"),
+            tax_rates=(Decimal("19"),),
+        )
+        invoice = Invoice(
+            invoice_id="TEST-1",
+            issue_date="2026-10-13",
+            supplier_name="Proveedor",
+            supplier_tax_id="900123456",
+            currency="COP",
+            lines=(line,),
+        )
+        catalog_product = {
+            "IdProducto": 123,
+            "Nombre": "=1+1",
+            "Referencia": "REF-1",
+            "Marca": "=1+1",
+            "Categoria": "Cuidado",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "invoice.xlsx"
+            with patch("facturacion.generar_importacion.parse_invoice", return_value=invoice):
+                generate_workbook(
+                    Path("unused.xml"),
+                    TEMPLATE,
+                    output,
+                    DEFAULT_TAX_CODES,
+                    product_ids_by_description={"1 1": [catalog_product]},
+                )
+
+            workbook = load_workbook(output, data_only=False)
+            exceptions = workbook["Excepciones"]
+            matches = workbook["Coincidencias automáticas"]
+            for sheet, cells in (
+                (exceptions, ((2, 4), (2, 13), (2, 17))),
+                (matches, ((2, 2), (2, 4), (2, 7))),
+            ):
+                for row, column in cells:
+                    cell = sheet.cell(row=row, column=column)
+                    self.assertEqual(cell.value, "=1+1")
+                    self.assertEqual(cell.data_type, "s")
+            workbook.close()
+
     def test_cli_output_path_distinguishes_providers_with_same_invoice_number(self) -> None:
         from types import SimpleNamespace
 
