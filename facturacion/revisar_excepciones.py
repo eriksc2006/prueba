@@ -2261,7 +2261,7 @@ def main() -> None:
             except Exception as error:
                 st.session_state["invoice_sync_error"] = str(error)
             st.rerun()
-    if invoice_ready and approval_is_current:
+    if invoice_ready:
         completed_workbook = _draft_workbook_data(queue_item, invoice_reviews)
         if completed_workbook is not None:
             download_column.download_button(
@@ -2271,7 +2271,7 @@ def main() -> None:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key=f"complete_download_{source.name}",
-                help="Descarga el Excel completo de esta factura con las decisiones revisadas y una aprobación vigente.",
+                help="Descarga el Excel completo con las decisiones revisadas; la aprobación formal es opcional.",
             )
         else:
             download_column.warning("No se pudo preparar el Excel de esta factura.")
@@ -2281,7 +2281,7 @@ def main() -> None:
             use_container_width=True,
             disabled=True,
             key=f"complete_download_disabled_{source.name}",
-            help="Se habilita al terminar la revisión y registrar una aprobación vigente.",
+            help="Se habilita al resolver todas las excepciones de esta factura.",
         )
     if invoice_ready and not approval_is_current:
         approver = st.text_input("Nombre de quien aprueba", value=reviewer_name, key=approver_key)
