@@ -466,6 +466,40 @@ class WorkbookGenerationTests(unittest.TestCase):
         self.assertIn("Excepciones", workbook.sheetnames)
         workbook.close()
 
+    def test_reviewer_match_sheet_saves_untrusted_text_as_literal(self) -> None:
+        from io import BytesIO
+
+        from openpyxl import Workbook
+
+        from facturacion.revisar_excepciones import _apply_automatic_matches
+
+        workbook = Workbook()
+        queue_item = {
+            "automatic_matches": [{
+                "line_id": "1",
+                "product_id": 123,
+                "description": "=1+1",
+                "product_name": "=1+1",
+                "reference": "REF-1",
+                "brand": "=1+1",
+                "category": "Cuidado",
+            }],
+            "import_row_by_line": {"1": 2},
+        }
+
+        _apply_automatic_matches(workbook, queue_item)
+        output = BytesIO()
+        workbook.save(output)
+        workbook.close()
+
+        reviewed = load_workbook(BytesIO(output.getvalue()), data_only=False)
+        matches = reviewed["Coincidencias automáticas"]
+        for row, column in ((2, 3), (2, 5), (2, 8)):
+            cell = matches.cell(row=row, column=column)
+            self.assertEqual(cell.value, "=1+1")
+            self.assertEqual(cell.data_type, "s")
+        reviewed.close()
+
     def test_draft_download_applies_safe_match_without_approval(self) -> None:
         from io import BytesIO
 
