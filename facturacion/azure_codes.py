@@ -24,6 +24,13 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).with_name(".env"))
 
 
+def _safe_csv_cell(value: Any) -> str:
+    text = str(value)
+    if text.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
 def _connection_string() -> str:
     """Construye la cadena de conexión ODBC usando la configuración local del entorno."""
     server = os.getenv("SQL_SERVER", "").strip()
@@ -374,7 +381,7 @@ def main() -> int:
         with args.output.open("w", newline="", encoding="utf-8-sig") as output:
             writer = csv.writer(output)
             writer.writerow(["CodigoBarras"])
-            writer.writerows((code,) for code in codes)
+            writer.writerows((_safe_csv_cell(code),) for code in codes)
         print(f"{len(codes)} códigos guardados en {args.output}")
     else:
         for code in codes:

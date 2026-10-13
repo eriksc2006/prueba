@@ -40,6 +40,8 @@ DEFAULT_XML_DIR = ROOT / "files" / "xml"
 DEFAULT_TEMPLATE = ROOT / "files" / "template" / "plantilla_importacion_conceptos_compra.xlsx"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 MAX_XML_BYTES = 20 * 1024 * 1024
+MAX_XML_DEPTH = 128
+MAX_XML_ELEMENTS = 200_000
 CENT = Decimal("0.02")
 PRICE_RECONCILIATION_LIMIT = Decimal("0.10")
 
@@ -116,6 +118,19 @@ def _value(element: ET.Element | None, *names: str) -> str:
     return _text(_path(element, *names))
 
 
+def _validate_xml_structure(root: ET.Element) -> None:
+    pending = [(root, 1)]
+    element_count = 0
+    while pending:
+        element, depth = pending.pop()
+        element_count += 1
+        if depth > MAX_XML_DEPTH:
+            raise InvoiceParseError("El XML supera la profundidad máxima permitida.")
+        if element_count > MAX_XML_ELEMENTS:
+            raise InvoiceParseError("El XML supera el número máximo de elementos permitidos.")
+        pending.extend((child, depth + 1) for child in element)
+
+
 def _decimal(value: str, label: str) -> Decimal:
     try:
         result = Decimal(value)
@@ -152,6 +167,7 @@ def _find_invoice(root: ET.Element) -> ET.Element:
             invoice = ET.fromstring(candidate)
         except ET.ParseError:
             continue
+        _validate_xml_structure(invoice)
         if _is_invoice(invoice):
             return invoice
 
@@ -289,6 +305,7 @@ def parse_invoice(path: Path) -> Invoice:
         root = ET.fromstring(path.read_bytes())
     except (ET.ParseError, OSError) as exc:
         raise InvoiceParseError(f"No se pudo leer el XML: {exc}") from exc
+    _validate_xml_structure(root)
 
     element = _find_invoice(root)
     lines = tuple(_parse_line(line) for line in _children(element, "InvoiceLine"))
@@ -619,6 +636,13 @@ def _line_warnings(
     return warnings
 
 
+def _append_literal_row(sheet: Worksheet, values: Iterable[Any]) -> None:
+    sheet.append(list(values))
+    for cell in sheet[sheet.max_row]:
+        if isinstance(cell.value, str):
+            cell.data_type = "s"
+
+
 def _write_detail(
     sheet: Worksheet,
     invoice: Invoice,
@@ -780,7 +804,7 @@ def generate_workbook(
             exceptions.append((line, candidate, score, margin, resolved, source_delta, import_discount, "; ".join(reasons)))
     if exceptions:
         exception_sheet = workbook.create_sheet("Excepciones")
-        exception_sheet.append([
+        _append_literal_row(exception_sheet, [
             "Línea", "Tipo", "Código de barras", "Descripción factura", "Cantidad",
             "Presentación factura", "Precio unitario XML", "Descuento XML", "Neto XML", "Neto calculado XML",
             "Ajuste aplicado al descuento", "IdProducto candidato", "Nombre candidato",
@@ -794,7 +818,7 @@ def generate_workbook(
             nearest = candidate or {}
             source_group = group_by_line[line.line_id]
             group_quantity, group_price, _, _ = _import_group_amounts(source_group)
-            exception_sheet.append([
+            _append_literal_row(exception_sheet, [
                 line.line_id,
                 reason,
                 line.barcode,
@@ -828,13 +852,13 @@ def generate_workbook(
             ])
     if automatic_matches:
         match_sheet = workbook.create_sheet("Coincidencias automáticas")
-        match_sheet.append([
+        _append_literal_row(match_sheet, [
             "Línea XML", "Descripción factura", "IdProducto EFFI", "Producto EFFI",
             "Código de barras EFFI", "Referencia EFFI", "Marca EFFI", "Categoría EFFI",
             "Puntaje", "Margen",
         ])
         for line, candidate, score, margin in automatic_matches:
-            match_sheet.append([
+            _append_literal_row(match_sheet, [
                 line.line_id,
                 line.description,
                 candidate.get("IdProducto"),

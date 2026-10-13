@@ -46,6 +46,7 @@ from facturacion.generar_importacion import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_TEMPLATE,
     DEFAULT_XML_DIR,
+    _append_literal_row,
     _is_full_discount_bonus,
     _group_import_lines,
     _confident_no_barcode_match,
@@ -1540,14 +1541,14 @@ def _apply_automatic_matches(
     if not matches:
         return
     sheet = workbook.create_sheet(AUTOMATIC_MATCH_SHEET)
-    sheet.append([
+    _append_literal_row(sheet, [
         "Línea XML", "Fila Excel", "Descripción factura", "IdProducto EFFI", "Producto EFFI",
         "Presentación", "Referencia", "Marca", "Categoría", "Código de barras EFFI", "Puntaje", "Margen",
     ])
     for match in matches:
         product_text = f"{match.get('product_name') or ''} {match.get('reference') or ''}"
         presentation = _presentation_tokens(product_text) or _variant_tokens(product_text)
-        sheet.append([
+        _append_literal_row(sheet, [
             match["line_id"],
             queue_item["import_row_by_line"].get(match["line_id"]),
             match.get("description"),
@@ -1936,8 +1937,8 @@ def _render_product(product: dict[str, Any] | None, confidence: Any = None) -> N
         st.info("No hay producto sugerido. Usa la búsqueda manual en EFFI.")
         return
     confidence_text = f"{float(confidence):.0%}" if confidence is not None else "Selección manual"
-    st.markdown(f"**{_display(product.get('Nombre'))}**")
-    st.caption(
+    st.text(_display(product.get("Nombre")))
+    st.text(
         f"EFFI {product.get('IdProducto')} · Ref. {_display(product.get('Referencia'))} · "
         f"Marca {_display(product.get('Marca'))} · Categoría {_display(product.get('Categoria'))}"
     )
@@ -2053,7 +2054,8 @@ def main() -> None:
     checked = st.session_state.get("invoice_auto_generation_checked_v2")
     if AUTO_SYNC_INVOICE_WORKBOOKS_ON_STARTUP and not checked:
         try:
-            _sync_invoice_workbooks(force=True)
+            with st.spinner("Revisando facturas nuevas o modificadas..."):
+                _sync_invoice_workbooks()
         except Exception as error:
             st.session_state["invoice_sync_error"] = str(error)
         st.session_state["invoice_auto_generation_checked_v2"] = True
@@ -2430,8 +2432,9 @@ def main() -> None:
     step_key = f"invoice_step_{source.name}"
     current_step = st.session_state.get(step_key, "lote")
 
-    st.markdown(f"## Revisión · Factura {invoice.invoice_id}")
-    st.caption(f"Proveedor: {invoice.supplier_name or 'Sin nombre'} · Fecha: {invoice.issue_date or 'Sin fecha'}")
+    st.markdown("## Revisión · Factura")
+    st.text(invoice.invoice_id)
+    st.text(f"Proveedor: {invoice.supplier_name or 'Sin nombre'} · Fecha: {invoice.issue_date or 'Sin fecha'}")
 
     if current_step == "lote":
         st.markdown("### Paso 1 · Vista general del Excel")
@@ -2633,22 +2636,23 @@ def main() -> None:
             candidate = None
         confidence = item.get("Puntaje")
 
-        st.markdown(f"#### Producto de la factura · Línea {line_id}")
+        st.markdown("#### Producto de la factura")
+        st.text(f"Línea {line_id}")
         xml_column, azure_column = st.columns(2, gap="large")
         with xml_column:
             st.markdown('<div class="compare-panel xml"><span class="eyebrow">Factura · XML</span></div>', unsafe_allow_html=True)
             description = line.description if line else item.get("Descripción factura")
-            st.markdown(f"**{html.escape(str(description or 'Descripción vacía'))}**")
+            st.text(str(description or "Descripción vacía"))
             st.caption(f"Código de barras: {_display(line.barcode if line else item.get('Código de barras'))}")
             if line and line.barcode:
                 if item.get("Artículo EFFI"):
                     st.success(f"GTIN registrado en EFFI · IdProducto {item['Artículo EFFI']}")
                 else:
                     st.error(
-                        f"Código de barras {line.barcode} no registrado en EFFI para el producto "
-                        f"'{html.escape(line.description or 'sin descripción')}'. "
+                        f"Código de barras {line.barcode} no registrado en EFFI. "
                         "Vincula este código al producto en EFFI; no se buscará por descripción."
                     )
+                    st.text(f"Descripción: {line.description or 'sin descripción'}")
             invoice_presentation = item.get("Presentación factura")
             if invoice_presentation is None or str(invoice_presentation).strip().lower() == "none":
                 invoice_presentation = ", ".join(sorted(_presentation_tokens(description or "")))
