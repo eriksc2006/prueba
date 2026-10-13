@@ -560,8 +560,8 @@ class WorkbookGenerationTests(unittest.TestCase):
         from facturacion.revisar_excepciones import _invoice_product_rows, _invoice_queue
 
         queue = _invoice_queue()
-        self.assertEqual(len(queue), 8)
-        self.assertEqual(sum(len(item["invoice"].lines) for item in queue), 170)
+        self.assertEqual(len(queue), 9)
+        self.assertEqual(sum(len(item["invoice"].lines) for item in queue), 177)
         self.assertTrue(all(item["product_count"] > 0 for item in queue))
         invoice = next(item for item in queue if item["invoice"].invoice_id == "3166244")
         products = _invoice_product_rows(invoice, {})
@@ -1683,8 +1683,8 @@ class WorkbookGenerationTests(unittest.TestCase):
 
     def test_all_sample_xml_files_have_invoice_lines(self) -> None:
         invoices = [parse_invoice(path) for path in XML_DIR.glob("*.xml")]
-        self.assertEqual(len(invoices), 8)
-        self.assertEqual(sum(len(invoice.lines) for invoice in invoices), 170)
+        self.assertEqual(len(invoices), 9)
+        self.assertEqual(sum(len(invoice.lines) for invoice in invoices), 177)
 
 
 if __name__ == "__main__":
