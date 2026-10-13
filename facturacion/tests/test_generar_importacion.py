@@ -328,7 +328,7 @@ class InvoiceParsingTests(unittest.TestCase):
         self.assertEqual(margin, 0.0)
         self.assertFalse(accepted)
 
-    def test_main_auto_syncs_on_first_load(self) -> None:
+    def test_main_incrementally_syncs_on_first_load(self) -> None:
         from facturacion import revisar_excepciones
 
         fake_streamlit = Mock()
@@ -355,7 +355,7 @@ class InvoiceParsingTests(unittest.TestCase):
         ):
             revisar_excepciones.main()
 
-        sync_mock.assert_called_once_with(force=True)
+        sync_mock.assert_called_once_with()
 
 
 class WorkbookGenerationTests(unittest.TestCase):
